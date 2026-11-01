@@ -32,8 +32,6 @@ The image generation process follows these key steps:
 
 ### Workflow Diagram
 
-*(**Action Required:** Insert a diagram or flowchart here illustrating the step-by-step process. You can use a tool like Mermaid or draw a simple flow chart.)*
-
 ```mermaid
 graph TD
     A[User Inputs Prompt] --> B{Text Encoding (CLIP)};
