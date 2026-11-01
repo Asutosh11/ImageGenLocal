@@ -13,12 +13,30 @@ This project provides a fully functional, local tool to generate high-quality im
 
 ---
 
-## 🚀 Tech Stack
+## Tech Stack
 
-*   **Model:** `[Any open source model]` (e.g., Stable Diffusion)
-*   **Framework:** `[PyTorch/TensorFlow]`
-*   **Libraries:** `[OpenCV, PIL, Transformers, etc.]`
-*   **Interface:** `[Gradio/Streamlit]`
+| Component | Technology |
+|---|---|
+| Core | Python 3.10–3.12 |
+| Image Generation | stable-diffusion.cpp |
+| AI Framework | PyTorch, Hugging Face Diffusers |
+| GPU Acceleration | NVIDIA CUDA 12 |
+| Model Formats | GGUF, Safetensors |
+| Model Hub | Hugging Face Hub |
+| ML Libraries | Transformers, Accelerate, GGUF |
+| Image Processing | Pillow |
+| Frontend | HTML, CSS, Vanilla JavaScript |
+| UI Framework | Bootstrap 5.3 |
+| Backend Server | Python HTTP Server |
+| Environment | Python Virtual Environment |
+
+### Under the Hood
+
+- **Native inference:** Prebuilt Windows CUDA binaries from stable-diffusion.cpp.
+- **Automated setup:** Python handles environment creation, dependency installation, engine downloads and model management.
+- **Model downloads:** Hugging Face Hub APIs with support for local checkpoints.
+- **Memory management:** Automatic GPU/CPU offloading to accommodate limited VRAM.
+- **Local execution:** Image generation, outputs and model storage remain on your machine.
 
 ## ⚙️ Setup Guide
 
