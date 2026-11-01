@@ -34,17 +34,17 @@ A fast, local platform for AI image creation.
 
 ### 🖼️ Generations (5 Examples)
 
-*   **Gen 1:** `[Prompt Description]` | `![Gen 1](path/to/img1.png)`
-*   **Gen 2:** `[Prompt Description]` | `![Gen 2](path/to/img2.png)`
-*   **Gen 3:** `[Prompt Description]` | `![Gen 3](path/to/img3.png)`
-*   **Gen 4:** `[Prompt Description]` | `![Gen 4](path/to/img4.png)`
-*   **Gen 5:** `[Prompt Description]` | `![Gen 5](path/to/img5.png)`
+*   **Gen 1:** `[Prompt Description]` | `![Gen 1](screenshots/generated/img1.png)`
+*   **Gen 2:** `[Prompt Description]` | `![Gen 2](screenshots/generated/img2.png)`
+*   **Gen 3:** `[Prompt Description]` | `![Gen 3](screenshots/generated/img3.png)`
+*   **Gen 4:** `[Prompt Description]` | `![Gen 4](screenshots/generated/img4.png)`
+*   **Gen 5:** `[Prompt Description]` | `![Gen 5](screenshots/generated/img5.png)`
 
 ### 🛠️ Tools Used (3 Examples)
 
-*   **Tool 1:** `[Tool Name]` (For preprocessing) | `![Tool 1](path/to/tool1.png)`
-*   **Tool 2:** `[Tool Name]` (For model loading) | `![Tool 2](path/to/tool2.png)`
-*   **Tool 3:** `[Tool Name]` (For interface display) | `![Tool 3](path/to/tool3.png)`
+*   **Tool 1:** `[Tool Name]` (For preprocessing) | `![Tool 1](screenshots/the_tool/tool1.png)`
+*   **Tool 2:** `[Tool Name]` (For model loading) | `![Tool 2](screenshots/the_tool/tool2.png)`
+*   **Tool 3:** `[Tool Name]` (For interface display) | `![Tool 3](screenshots/the_tool/tool3.png)`
 
 ---
 
