@@ -55,9 +55,7 @@ python generate.py
 
 ## 📸 Showcase
 
-**Visual Examples**
-
-## Tools
+## The Tool
 
 <p align="center">
   <img src="./screenshots/the_tool/t2.png" />
@@ -69,7 +67,7 @@ python generate.py
   <img src="./screenshots/the_tool/t3.png" />
 </p>
 
-## Image Generations
+## Output Images
 
 <p align="center">
   <img src="./screenshots/generated/g3.png" width="48%" />
