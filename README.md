@@ -8,7 +8,6 @@ A fast, local platform for AI image creation.
 ## 💡 Project Overview
 
 This project provides a fully functional, local tool to generate high-quality images using local models, setup and used from HuggingFace. It allows users to generate content instantly without requiring external API calls, offering speed, privacy, and complete control over the generation process. 
----
 
 ## Tech Stack
 
