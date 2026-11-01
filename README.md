@@ -58,13 +58,10 @@ python generate.py
 ## The Tool
 
 <p align="center">
-  <img src="./screenshots/the_tool/t2.png" />
+  <img src="./screenshots/the_tool/t3.png" />
 </p>
 <p align="center">
   <img src="./screenshots/the_tool/t1.png" />
-</p>
-<p align="center">
-  <img src="./screenshots/the_tool/t3.png" />
 </p>
 
 ## Output Images
