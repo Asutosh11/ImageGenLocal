@@ -76,6 +76,9 @@ python generate.py
   <img src="./screenshots/generated/g5.png" width="48%" />
 </p>
 
+<p align="center">
+  <img src="./screenshots/generated/g6.png" width="48%" />
+</p>
 ---
 
 ## 📄 License
