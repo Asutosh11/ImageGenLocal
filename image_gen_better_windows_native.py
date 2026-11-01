@@ -1,0 +1,1954 @@
+#!/usr/bin/env python3
+"""
+Image Gen Local - one-file, fully local image generation UI (Bootstrap front end).
+
+SDXL GGUF models run through the native Windows stable-diffusion.cpp CUDA executable.
+The Python web app runs in its private Windows virtual environment. On first use the
+app clones/builds the official sd.cpp CUDA image (compute capability 7.5) and downloads
+RealVisXL Lightning GGUF.
+  gpu       everything on the GPU
+  balanced  transformer stays on the GPU while sampling, text encoder / VAE swap in and out
+  partial   transformer is split block-by-block; only the blocks that fit stay on the GPU
+  auto      picks the lightest of the above that fits your free VRAM, and steps up
+            automatically if a run still hits out-of-memory
+
+Models
+  * Ranked public, ungated OpenRAIL safetensors models for 6 GB GPUs, fastest first.
+  * SD 1.5 checkpoints for speed and SDXL / distilled SDXL checkpoints for higher detail.
+  * Local .safetensors checkpoints can also be placed in ./localgen_data/models.
+
+Run:   python image_gen_better.py
+
+Options:
+  --offline      never contact the internet (models + Bootstrap must already be downloaded)
+  --reinstall    wipe and rebuild the private environment
+  --setup-only   install everything, don't launch
+  --port N       UI port (default 7860)
+  --no-browser   don't auto-open the browser
+  --theme X      default look: dark (default), light, auto. Colour themes are in the UI.
+
+Everything lives in ./localgen_data. Delete that folder to uninstall. No telemetry, no cloud.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+SETUP_VERSION = "7"  # Native Windows stable-diffusion.cpp CUDA backend
+ROOT = Path(__file__).resolve().parent / "localgen_data"
+SDCPP_DIR = ROOT / "sd_cpp"
+VENV_DIR = ROOT / "venv"
+MODELS_DIR = ROOT / "models"
+OUTPUT_DIR = ROOT / "outputs"
+STATIC_DIR = ROOT / "static"
+MARKER = ROOT / ".setup_done"
+BOOTSTRAP_VERSION = "5.3.3"
+BOOTSTRAP_URL = f"https://cdn.jsdelivr.net/npm/bootstrap@{BOOTSTRAP_VERSION}/dist/css/bootstrap.min.css"
+TORCH_INDEXES = [
+    "https://download.pytorch.org/whl/cu126",
+    "https://download.pytorch.org/whl/cu124",
+    "https://download.pytorch.org/whl/cu121",
+]
+SUPPORTED_PY = [(3, 12), (3, 11), (3, 10)]  # PyTorch wheels exist for these
+PACKAGES = [
+    "diffusers", "transformers", "accelerate", "safetensors", "pillow",
+    "huggingface_hub", "gguf", "sentencepiece", "protobuf",
+]
+
+# --------------------------------------------------------------------------- #
+# Hugging Face authentication
+# Never embed a personal token in source code. Prefer HF_TOKEN in the process
+# environment, or use `hf auth login` so huggingface_hub reads its stored credential.
+# Public, ungated model downloads work without any token or licence click-through.
+# --------------------------------------------------------------------------- #
+HF_TOKEN = ""
+
+
+def resolve_hf_token() -> str:
+    for key in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        value = (os.environ.get(key) or "").strip()
+        if value.startswith("hf_"):
+            return value
+    try:
+        from huggingface_hub import get_token
+        value = (get_token() or "").strip()
+        if value.startswith("hf_"):
+            return value
+    except Exception:
+        pass
+    return ""
+
+
+try:  # avoid Windows console encoding crashes
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+
+# --------------------------------------------------------------------------- #
+# Bootstrap CSS (downloaded once, served locally so the UI works offline)
+# --------------------------------------------------------------------------- #
+def ensure_bootstrap(offline: bool = False) -> bool:
+    target = STATIC_DIR / "bootstrap.min.css"
+    if target.exists() and target.stat().st_size > 10_000:
+        return True
+    if offline:
+        return False
+    try:
+        STATIC_DIR.mkdir(parents=True, exist_ok=True)
+        req = urllib.request.Request(BOOTSTRAP_URL, headers={"User-Agent": "image-gen-local"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = r.read()
+        if len(data) < 10_000:
+            return False
+        target.write_bytes(data)
+        return True
+    except Exception as e:
+        print(f"  (couldn't download Bootstrap CSS: {e}; the page will fall back to the CDN link)")
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# Bootstrap / setup
+# --------------------------------------------------------------------------- #
+def venv_python() -> Path:
+    if os.name == "nt":
+        return VENV_DIR / "Scripts" / "python.exe"
+    return VENV_DIR / "bin" / "python"
+
+
+def is_setup() -> bool:
+    return (MARKER.exists() and MARKER.read_text().strip() == SETUP_VERSION and venv_python().exists())
+
+
+def run(cmd):
+    print("  >", " ".join(str(c) for c in cmd), flush=True)
+    subprocess.check_call([str(c) for c in cmd])
+
+
+def py_version_of(cmd):
+    try:
+        out = subprocess.run([*cmd, "-c", "import sys;print(sys.version_info[0], sys.version_info[1])"],
+                             capture_output=True, text=True, timeout=30).stdout.split()
+        return (int(out[0]), int(out[1]))
+    except Exception:
+        return None
+
+
+def venv_py_version():
+    return py_version_of([str(venv_python())])
+
+
+def find_compatible_python():
+    if sys.version_info[:2] in SUPPORTED_PY:
+        return [sys.executable]
+
+    def probe():
+        local = os.environ.get("LOCALAPPDATA")
+        for major, minor in SUPPORTED_PY:
+            cands = [["py", f"-{major}.{minor}"], [f"python{major}.{minor}"]]
+            if local:
+                cands.append([str(Path(local) / "Programs" / "Python" / f"Python{major}{minor}" / "python.exe")])
+            for cmd in cands:
+                if py_version_of(cmd) == (major, minor):
+                    return cmd
+        return None
+
+    found = probe()
+    if found:
+        return found
+    print(f"\nYour Python is {sys.version_info[0]}.{sys.version_info[1]}, but PyTorch only ships for "
+          "Python 3.10-3.12.")
+    if os.name == "nt" and shutil.which("winget"):
+        ans = input("Install Python 3.12 next to it now using winget? [Y/n] ").strip().lower()
+        if ans in ("", "y", "yes"):
+            subprocess.call(["winget", "install", "-e", "--id", "Python.Python.3.12", "--scope", "user",
+                             "--accept-package-agreements", "--accept-source-agreements"])
+            found = probe()
+            if found:
+                return found
+    sys.exit("\nNo compatible Python found. Install Python 3.12 from https://www.python.org/downloads/ "
+             f"then run:\n    py -3.12 \"{Path(__file__).resolve()}\"")
+
+
+def setup(force: bool = False):
+    print("\n=== Image Gen Local setup (one time only) ===\n")
+    for d in (ROOT, MODELS_DIR, OUTPUT_DIR, STATIC_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+    if VENV_DIR.exists() and venv_python().exists() and venv_py_version() not in SUPPORTED_PY:
+        print("Existing environment uses an unsupported Python version; rebuilding it...")
+        force = True
+    if force:
+        MARKER.unlink(missing_ok=True)
+        if VENV_DIR.exists():
+            print("Removing old environment...")
+            shutil.rmtree(VENV_DIR, ignore_errors=True)
+
+    if not venv_python().exists():
+        base = find_compatible_python()
+        print(f"[1/5] Creating private virtual environment using {' '.join(base)} ...")
+        subprocess.check_call([*base, "-m", "venv", str(VENV_DIR)])
+    else:
+        print("[1/5] Reusing existing virtual environment.")
+
+    py = venv_python()
+    print("[2/5] Updating pip...")
+    run([py, "-m", "pip", "install", "--upgrade", "pip"])
+
+    print("[3/5] Installing PyTorch with CUDA (large download the first time)...")
+    installed = False
+    for index in TORCH_INDEXES:
+        try:
+            run([py, "-m", "pip", "install", "torch", "torchvision", "--index-url", index])
+            installed = True
+            break
+        except subprocess.CalledProcessError:
+            print(f"  (no luck with {index}, trying the next one)")
+    if not installed:
+        sys.exit("\nCould not install PyTorch from any CUDA index. Check your connection and that the "
+                 "venv's Python is 3.10-3.12.")
+
+    print("[4/5] Installing/upgrading diffusers, transformers, gguf, bitsandbytes...")
+    run([py, "-m", "pip", "install", "--upgrade", *PACKAGES])
+
+    print("[5/5] Fetching Bootstrap CSS...")
+    ensure_bootstrap()
+
+    print("\nChecking GPU access...")
+    res = subprocess.run([str(py), "-c", "import torch;print(torch.cuda.is_available());"
+                          "print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"],
+                         capture_output=True, text=True)
+    lines = res.stdout.strip().splitlines()
+    if not lines or lines[0] != "True":
+        sys.exit("\nPyTorch can't see your NVIDIA GPU. Update your NVIDIA driver, then run again with "
+                 "--reinstall.\n" + res.stderr[-500:])
+    print("GPU found:", lines[1] if len(lines) > 1 else "")
+
+    for mod, note in (("bitsandbytes", "4-bit text encoders will not load"),
+                      ("gguf", "GGUF models will not load")):
+        chk = subprocess.run([str(py), "-c", f"import {mod}"], capture_output=True, text=True)
+        if chk.returncode != 0:
+            print(f"\nWARNING: {mod} failed to import; {note}.\n" + chk.stderr[-400:])
+
+    MARKER.write_text(SETUP_VERSION)
+    print("\nSetup complete.\n")
+
+
+# --------------------------------------------------------------------------- #
+# Front end (Bootstrap 5.3). Placeholders: __BSLINK__ __GPU__ __DEFAULT_THEME__
+# --------------------------------------------------------------------------- #
+INDEX_HTML = r"""<!doctype html>
+<html lang="en" data-bs-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Image Gen Local</title>
+__BSLINK__
+<script>
+(function () {
+  var t = "__DEFAULT_THEME__";
+  try { t = localStorage.getItem("igl-theme") || t; } catch (e) {}
+  if (t === "auto") t = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "abyssal";
+  document.documentElement.setAttribute("data-theme", t);
+  document.documentElement.setAttribute("data-bs-theme", t === "light" ? "light" : "dark");
+})();
+</script>
+<style>
+html[data-theme="abyssal"] { color-scheme: dark; --solid:#141820; --accent:#7ed3bf; --accent-strong:#a3e6d4; --accent-soft:rgba(126,211,191,.16);
+  --bg:#0a0d13; --card:rgba(159,178,204,.07); --card2:rgba(159,178,204,.12); --line:rgba(159,178,204,.16);
+  --text:#eef1f5; --dim:#a8b4c4; --faint:#7a8898; --btn-fg:#0d1117; }
+html[data-theme="forest"] { color-scheme: dark; --solid:#141c14; --accent:#9fd08a; --accent-strong:#bde3ab; --accent-soft:rgba(159,208,138,.16);
+  --bg:#0c120c; --card:rgba(150,190,140,.07); --card2:rgba(150,190,140,.12); --line:rgba(150,190,140,.16);
+  --text:#eef2ea; --dim:#a8bca3; --faint:#7a8f76; --btn-fg:#0c120c; }
+html[data-theme="cocoa"] { color-scheme: dark; --solid:#1c1713; --accent:#e0b48f; --accent-strong:#f0cdb0; --accent-soft:rgba(224,180,143,.16);
+  --bg:#120e0c; --card:rgba(205,165,135,.08); --card2:rgba(205,165,135,.13); --line:rgba(205,165,135,.18);
+  --text:#f2ece5; --dim:#c0a892; --faint:#8a7060; --btn-fg:#120e0c; }
+html[data-theme="dark"] { color-scheme: dark; --solid:#111111; --accent:#7ed3bf; --accent-strong:#a3e6d4; --accent-soft:rgba(126,211,191,.16);
+  --bg:#000; --card:rgba(255,255,255,.06); --card2:rgba(255,255,255,.10); --line:rgba(255,255,255,.14);
+  --text:#f1f1ee; --dim:#a8acb8; --faint:#7a7e8a; --btn-fg:#0d1117; }
+html[data-theme="light"] { color-scheme: light; --solid:#f0ede6; --accent:#2fa889; --accent-strong:#1f8a70; --accent-soft:rgba(47,168,137,.12);
+  --bg:#f5f4f0; --card:rgba(255,255,255,.85); --card2:rgba(240,238,232,.95); --line:rgba(0,0,0,.12);
+  --text:#1a1d24; --dim:#4a5060; --faint:#727880; --btn-fg:#fff; }
+
+html[data-theme] {
+  --bs-body-bg: var(--bg); --bs-body-color: var(--text); --bs-emphasis-color: var(--text);
+  --bs-secondary-color: var(--dim); --bs-tertiary-color: var(--faint);
+  --bs-border-color: var(--line); --bs-link-color: var(--accent-strong); --bs-link-hover-color: var(--accent);
+  --bs-secondary-bg: var(--card2); --bs-tertiary-bg: var(--card);
+}
+body { background: var(--bg); color: var(--text); font-weight: 300; }
+::selection { background: var(--accent-soft); color: var(--accent-strong); }
+h1 { font-weight: 400; letter-spacing: -.01em; }
+.subtitle { color: var(--dim); font-style: normal; }
+.card { --bs-card-bg: var(--card); --bs-card-border-color: var(--line); --bs-card-cap-bg: transparent; }
+.form-label { font-size: .7rem; font-weight: 500; letter-spacing: .12em; text-transform: uppercase; color: var(--faint); margin-bottom: .25rem; }
+.form-control, .form-select { background-color: var(--card2); border-color: var(--line); color: var(--text); font-weight: 300; }
+.form-control:focus, .form-select:focus { background-color: var(--card2); color: var(--text);
+  border-color: var(--accent); box-shadow: 0 0 0 .2rem var(--accent-soft); }
+.form-control::placeholder { color: var(--faint); }
+/* native dropdown lists ignore translucent backgrounds, so give them a solid themed one */
+select.form-select, select.form-select option, select.form-select optgroup {
+  background-color: var(--solid); color: var(--text); }
+select.form-select { background-color: var(--card2); }
+select.form-select option:checked, select.form-select option:hover { background-color: var(--accent-soft); color: var(--accent-strong); }
+.form-text, .small-note { color: var(--faint) !important; font-size: .78rem; }
+.form-range::-webkit-slider-thumb { background: var(--accent); }
+.form-range::-moz-range-thumb { background: var(--accent); }
+.form-check-input:checked { background-color: var(--accent); border-color: var(--accent); }
+.btn-primary { --bs-btn-bg: var(--accent); --bs-btn-border-color: var(--accent); --bs-btn-color: var(--btn-fg);
+  --bs-btn-hover-bg: var(--accent-strong); --bs-btn-hover-border-color: var(--accent-strong); --bs-btn-hover-color: var(--btn-fg);
+  --bs-btn-active-bg: var(--accent-strong); --bs-btn-active-border-color: var(--accent-strong); --bs-btn-active-color: var(--btn-fg);
+  --bs-btn-disabled-bg: var(--accent); --bs-btn-disabled-border-color: var(--accent); --bs-btn-disabled-color: var(--btn-fg); font-weight: 500; }
+.btn-outline-secondary { --bs-btn-color: var(--dim); --bs-btn-border-color: var(--line);
+  --bs-btn-hover-bg: var(--card2); --bs-btn-hover-color: var(--text); --bs-btn-hover-border-color: var(--line);
+  --bs-btn-active-bg: var(--accent-soft); --bs-btn-active-color: var(--accent-strong); --bs-btn-active-border-color: var(--accent); }
+.nav-tabs { --bs-nav-tabs-border-color: var(--line); --bs-nav-link-color: var(--dim); --bs-nav-link-hover-color: var(--text);
+  --bs-nav-tabs-link-active-bg: transparent; --bs-nav-tabs-link-active-color: var(--accent-strong);
+  --bs-nav-tabs-link-active-border-color: var(--line) var(--line) var(--bg); --bs-nav-tabs-link-hover-border-color: transparent; }
+.progress { --bs-progress-bg: var(--card2); --bs-progress-bar-bg: var(--accent); height: .6rem; }
+.badge-gpu { background: var(--accent-soft); border: 1px solid var(--accent); color: var(--accent-strong); font-weight: 600; }
+.alert-info-soft { background: var(--card); border: 1px solid var(--line); color: var(--dim); font-size: .82rem; }
+.sticky-panel { position: sticky; top: 1rem; max-height: calc(100vh - 2rem); overflow-y: auto; }
+.result-img { cursor: zoom-in; aspect-ratio: 1 / 1; object-fit: contain; background: var(--card2); }
+.empty { border: 1px dashed var(--line); border-radius: var(--bs-border-radius-lg); color: var(--faint); min-height: 40vh; }
+#lightbox { position: fixed; inset: 0; z-index: 2000; background: rgba(0,0,0,.88); display: none; cursor: zoom-out; }
+#lightbox img { max-width: 96vw; max-height: 96vh; }
+.d-gguf { display: none; }
+.is-gguf .d-gguf { display: block; }
+.d-localgguf { display: none; }
+.is-localgguf .d-localgguf { display: block; }
+.hist-thumb { aspect-ratio: 1 / 1; object-fit: cover; cursor: zoom-in; }
+</style>
+</head>
+<body>
+<div class="container-fluid px-3 px-lg-4 py-4">
+
+  <header class="d-flex flex-wrap align-items-end justify-content-between gap-3 mb-4">
+    <div>
+      <div class="d-flex flex-wrap align-items-center gap-2">
+        <h1 class="h2 mb-0">Image Gen Local</h1>
+        <span class="badge rounded-pill badge-gpu">__GPU__</span>
+      </div>
+      <p class="subtitle mb-0 mt-1">Local image generation. Nothing leaves this machine.</p>
+    </div>
+    <div style="min-width: 190px;">
+      <select id="theme" class="form-select form-select-sm" aria-label="Colour theme"></select>
+    </div>
+  </header>
+
+  <div class="row g-4">
+    <!-- controls -->
+    <div class="col-12 col-lg-5 col-xl-4 col-xxl-3">
+      <div class="card sticky-panel" id="panel">
+        <div class="card-body d-flex flex-column gap-3">
+          <textarea id="prompt" class="form-control" rows="5" placeholder="Describe what you want to see..."></textarea>
+          <div class="d-flex gap-2">
+            <button id="go" class="btn btn-primary flex-grow-1 py-2" type="button">
+              <span id="go-spin" class="spinner-border spinner-border-sm me-2 d-none" aria-hidden="true"></span>
+              <span id="go-text">Generate</span>
+            </button>
+            <button id="stop" class="btn btn-outline-secondary" type="button" disabled>Stop</button>
+          </div>
+
+          <div>
+            <label class="form-label" for="model">Model</label>
+            <select id="model" class="form-select"></select>
+            <div id="info" class="alert alert-info-soft py-2 px-3 mt-2 mb-0"></div>
+            <div class="small-note mt-2">RealVisXL GGUF runs through the native Windows stable-diffusion.cpp CUDA engine. The engine and model are downloaded automatically on first generation. Other legacy models remain available.</div>
+          </div>
+
+          <div class="d-gguf">
+            <div class="row g-2">
+              <div class="col-6">
+                <label class="form-label" for="quant">GGUF quantization</label>
+                <select id="quant" class="form-select"></select>
+              </div>
+              <div class="col-6">
+                <label class="form-label" for="memory">Memory</label>
+                <select id="memory" class="form-select">
+                  <option value="auto">Auto</option>
+                  <option value="gpu">All on GPU</option>
+                  <option value="balanced">Balanced offload</option>
+                  <option value="partial">Partial offload</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-text">Auto keeps as much on the GPU as fits and offloads only the rest to CPU.</div>
+          </div>
+
+          <div class="row g-2 align-items-end">
+            <div class="col-12 col-sm-7">
+              <label class="form-label d-block">Shape</label>
+              <div class="btn-group w-100" role="group" aria-label="Shape">
+                <input type="radio" class="btn-check" name="shape" id="sh-sq" value="Square" checked>
+                <label class="btn btn-outline-secondary btn-sm" for="sh-sq">Square</label>
+                <input type="radio" class="btn-check" name="shape" id="sh-po" value="Portrait">
+                <label class="btn btn-outline-secondary btn-sm" for="sh-po">Portrait</label>
+                <input type="radio" class="btn-check" name="shape" id="sh-la" value="Landscape">
+                <label class="btn btn-outline-secondary btn-sm" for="sh-la">Landscape</label>
+              </div>
+            </div>
+            <div class="col-12 col-sm-5">
+              <label class="form-label" for="count">Images: <span id="count-v">1</span></label>
+              <input id="count" type="range" class="form-range" min="1" max="8" step="1" value="1">
+            </div>
+          </div>
+
+          <div>
+            <button class="btn btn-sm btn-outline-secondary w-100" type="button" id="adv-toggle">Advanced options</button>
+            <div class="collapse mt-3" id="adv">
+              <div class="d-flex flex-column gap-3">
+                <div>
+                  <label class="form-label" for="negative">Negative prompt</label>
+                  <textarea id="negative" class="form-control" rows="2"></textarea>
+                  <div class="form-text">Used by SD models, and Z-Image only when guidance is above 1.</div>
+                </div>
+                <div class="row g-2">
+                  <div class="col-6"><label class="form-label" for="steps">Steps: <span id="steps-v"></span></label>
+                    <input id="steps" type="range" class="form-range" min="1" max="60" step="1"></div>
+                  <div class="col-6"><label class="form-label" for="cfg">Guidance: <span id="cfg-v"></span></label>
+                    <input id="cfg" type="range" class="form-range" min="0" max="15" step="0.5"></div>
+                  <div class="col-6"><label class="form-label" for="width">Width: <span id="width-v"></span></label>
+                    <input id="width" type="range" class="form-range" min="256" max="1024" step="64"></div>
+                  <div class="col-6"><label class="form-label" for="height">Height: <span id="height-v"></span></label>
+                    <input id="height" type="range" class="form-range" min="256" max="1024" step="64"></div>
+                </div>
+                <div class="row g-2">
+                  <div class="col-5"><label class="form-label" for="seed">Seed (-1 random)</label>
+                    <input id="seed" type="number" class="form-control" value="-1"></div>
+                  <div class="col-7"><label class="form-label" for="sampler">Sampler (SD models)</label>
+                    <select id="sampler" class="form-select"></select></div>
+                </div>
+                <div>
+                  <label class="form-label" for="precision">Precision</label>
+                  <select id="precision" class="form-select">
+                    <option>auto</option><option>fp16</option><option>fp32</option>
+                  </select>
+                  <div class="form-text">auto: FP16 on GTX 1660 (BF16 is unsupported on this GPU).</div>
+                </div>
+                <div class="d-localgguf">
+                  <label class="form-label" for="family">GGUF family (local file)</label>
+                  <select id="family" class="form-select"></select>
+                  <div class="form-text">Auto guesses from the file name. Set it if the guess is wrong.</div>
+                </div>
+                <div class="form-check form-switch">
+                  <input class="form-check-input" type="checkbox" id="force-sdxl">
+                  <label class="form-check-label small" for="force-sdxl">Treat local checkpoint as SDXL</label>
+                </div>
+                <div>
+                  <label class="form-label" for="token">Hugging Face token</label>
+                  <input id="token" type="password" class="form-control" placeholder="hf_... (optional, this session only)" autocomplete="off">
+                  <div id="token-note" class="form-text"></div>
+                </div>
+                <div class="d-flex flex-wrap gap-2">
+                  <button class="btn btn-sm btn-outline-secondary" type="button" id="refresh">Refresh models</button>
+                  <button class="btn btn-sm btn-outline-secondary" type="button" id="open">Open outputs</button>
+                  <button class="btn btn-sm btn-outline-secondary" type="button" id="free">Free VRAM</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- results -->
+    <div class="col-12 col-lg-7 col-xl-8 col-xxl-9">
+      <ul class="nav nav-tabs mb-3" role="tablist">
+        <li class="nav-item"><button class="nav-link active" id="tab-res" type="button">Results</button></li>
+        <li class="nav-item"><button class="nav-link" id="tab-his" type="button">History</button></li>
+        <li class="nav-item"><button class="nav-link" id="tab-logs" type="button">Terminal logs</button></li>
+      </ul>
+
+      <div id="pane-res">
+        <div id="progress-wrap" class="mb-2 d-none">
+          <div class="progress" role="progressbar" aria-label="Progress">
+            <div id="bar" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div>
+          </div>
+        </div>
+        <div id="status" class="small-note mb-3">Ready.</div>
+        <div id="empty" class="empty d-flex align-items-center justify-content-center text-center p-4">Your images will appear here.</div>
+        <div id="grid" class="row row-cols-1 row-cols-md-2 row-cols-xxl-3 g-3"></div>
+      </div>
+
+      <div id="pane-his" class="d-none">
+        <div id="hist-empty" class="empty d-flex align-items-center justify-content-center text-center p-4 d-none">Nothing generated yet.</div>
+        <div id="hist" class="row row-cols-2 row-cols-md-3 row-cols-xl-4 row-cols-xxl-6 g-2"></div>
+      </div>
+
+      <div id="pane-logs" class="d-none">
+        <div class="d-flex flex-wrap align-items-center justify-content-between gap-2 mb-2">
+          <div class="small-note">Live Python stdout and stderr, including model downloads, warnings and tracebacks. Also continues printing in the terminal.</div>
+          <div class="d-flex gap-2">
+            <button class="btn btn-sm btn-outline-secondary" type="button" id="logs-refresh">Refresh</button>
+            <button class="btn btn-sm btn-outline-secondary" type="button" id="logs-copy">Copy logs</button>
+          </div>
+        </div>
+        <pre id="terminal-logs" class="p-3 rounded border" style="height: min(68vh, 720px); overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; background:var(--solid); color:var(--text); font:12px/1.5 Consolas, 'Cascadia Mono', monospace;">Waiting for Python output...</pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="lightbox"><div class="h-100 d-flex align-items-center justify-content-center"><img id="lb-img" alt=""></div></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let CFG = null, timer = null, curModel = null;
+
+async function api(path, body) {
+  const opt = body === undefined ? {} : {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)};
+  const r = await fetch(path, opt);
+  return r.json();
+}
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text !== undefined) e.textContent = text; return e; }
+
+function dims(size, shape) {
+  const r = (v) => Math.max(256, Math.min(1024, Math.round(v / 64) * 64));
+  if (shape === "Portrait") return [size, r(size * 1.5)];
+  if (shape === "Landscape") return [r(size * 1.5), size];
+  return [size, size];
+}
+const shape = () => document.querySelector("input[name=shape]:checked").value;
+function bindRange(id) { const i = $(id), v = $(id + "-v"); const u = () => { v.textContent = i.value; }; i.addEventListener("input", u); u(); }
+["count", "steps", "cfg", "width", "height"].forEach(bindRange);
+function setRange(id, val) { $(id).value = val; $(id + "-v").textContent = val; }
+
+function applyInfo(m, keepSize) {
+  $("info").innerHTML = "";
+  $("info").appendChild(document.createTextNode(m.info));
+  const root = document.documentElement;
+  document.body.classList.toggle("is-gguf", !!m.gguf);
+  document.body.classList.toggle("is-localgguf", !!m.local_gguf);
+  setRange("steps", m.steps); setRange("cfg", m.cfg);
+  const [w, h] = dims(m.size, shape());
+  setRange("width", w); setRange("height", h);
+  curModel = m;
+}
+async function onModel() {
+  const m = await api("/api/modelinfo?model=" + encodeURIComponent($("model").value));
+  if (m.error) { $("status").textContent = m.error; return; }
+  applyInfo(m);
+}
+function onShape() { if (!curModel) return; const [w, h] = dims(curModel.size, shape()); setRange("width", w); setRange("height", h); }
+
+function fillModels(list, keep) {
+  const sel = $("model"); sel.innerHTML = "";
+  const groups = {};
+  list.forEach((m) => {
+    if (!groups[m.group]) { groups[m.group] = el("optgroup"); groups[m.group].label = m.group; sel.appendChild(groups[m.group]); }
+    const o = el("option", null, m.label); o.value = m.value; groups[m.group].appendChild(o);
+  });
+  if (keep && list.some((m) => m.value === keep)) sel.value = keep;
+}
+
+function showImages(images) {
+  const grid = $("grid"); grid.innerHTML = "";
+  $("empty").classList.toggle("d-none", images.length > 0);
+  images.forEach((im) => {
+    const col = el("div", "col"), card = el("div", "card h-100 overflow-hidden");
+    const img = el("img", "card-img-top result-img"); img.src = im.url; img.alt = "seed " + im.seed; img.loading = "lazy";
+    img.addEventListener("click", () => openLb(im.url));
+    const foot = el("div", "card-footer d-flex justify-content-between align-items-center small");
+    foot.appendChild(el("span", "text-body-secondary", "seed " + im.seed));
+    const a = el("a", "link-primary text-decoration-none", "Download"); a.href = im.url; a.download = im.name;
+    foot.appendChild(a); card.appendChild(img); card.appendChild(foot); col.appendChild(card); grid.appendChild(col);
+  });
+}
+function openLb(url) { $("lb-img").src = url; $("lightbox").style.display = "block"; }
+$("lightbox").addEventListener("click", () => { $("lightbox").style.display = "none"; });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("lightbox").style.display = "none"; });
+
+function setRunning(r) {
+  $("go").disabled = r; $("stop").disabled = !r;
+  $("go-spin").classList.toggle("d-none", !r);
+  $("go-text").textContent = r ? "Generating..." : "Generate";
+  $("progress-wrap").classList.toggle("d-none", !r);
+}
+async function poll() {
+  let s;
+  try { s = await api("/api/status"); } catch (e) { return; }
+  $("bar").style.width = Math.round((s.progress || 0) * 100) + "%";
+  $("status").textContent = s.error ? s.error : s.message;
+  $("status").classList.toggle("text-danger", !!s.error);
+  showImages(s.images || []);
+  setRunning(s.running);
+  if (!s.running) { clearInterval(timer); timer = null; }
+}
+function startPolling() { if (!timer) timer = setInterval(poll, 500); poll(); }
+
+async function generate() {
+  const p = {
+    prompt: $("prompt").value, negative: $("negative").value, model: $("model").value,
+    family: $("family").value, quant: $("quant").value, memory: $("memory").value,
+    force_sdxl: $("force-sdxl").checked, sampler: $("sampler").value,
+    steps: +$("steps").value, cfg: +$("cfg").value, width: +$("width").value, height: +$("height").value,
+    count: +$("count").value, seed: $("seed").value === "" ? -1 : +$("seed").value,
+    precision: $("precision").value, token: $("token").value,
+  };
+  const r = await api("/api/generate", p);
+  if (r.error) { $("status").textContent = r.error; $("status").classList.add("text-danger"); return; }
+  $("status").classList.remove("text-danger");
+  setRunning(true); startPolling();
+}
+$("go").addEventListener("click", generate);
+$("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); generate(); } });
+$("stop").addEventListener("click", async () => { const r = await api("/api/stop", {}); $("status").textContent = r.message; });
+$("free").addEventListener("click", async () => { const r = await api("/api/free", {}); $("status").textContent = r.message; });
+$("open").addEventListener("click", async () => { const r = await api("/api/open", {}); $("status").textContent = r.message; });
+$("refresh").addEventListener("click", async () => { const c = await api("/api/models"); fillModels(c.models, $("model").value); onModel(); });
+$("model").addEventListener("change", onModel);
+document.querySelectorAll("input[name=shape]").forEach((r) => r.addEventListener("change", onShape));
+$("adv-toggle").addEventListener("click", () => { $("adv").classList.toggle("show"); });
+
+let logsTimer = null;
+function selectTab(which) {
+  for (const [key, id] of [["res", "res"], ["his", "his"], ["logs", "logs"]]) {
+    $("tab-" + id).classList.toggle("active", which === key);
+    $("pane-" + id).classList.toggle("d-none", which !== key);
+  }
+  if (logsTimer) { clearInterval(logsTimer); logsTimer = null; }
+  if (which === "his") loadHistory();
+  if (which === "logs") {
+    loadTerminalLogs();
+    logsTimer = setInterval(loadTerminalLogs, 1000);
+  }
+}
+$("tab-res").addEventListener("click", () => selectTab("res"));
+$("tab-his").addEventListener("click", () => selectTab("his"));
+$("tab-logs").addEventListener("click", () => selectTab("logs"));
+async function loadTerminalLogs() {
+  const box = $("terminal-logs");
+  const wasAtBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 48;
+  try {
+    const r = await api("/api/logs");
+    if (box.textContent !== r.logs) {
+      box.textContent = r.logs || "No Python output captured yet.";
+      if (wasAtBottom) box.scrollTop = box.scrollHeight;
+    }
+  } catch (e) {
+    box.textContent += "\n[Could not fetch terminal logs: " + e + "]";
+  }
+}
+$("logs-refresh").addEventListener("click", loadTerminalLogs);
+$("logs-copy").addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText($("terminal-logs").textContent);
+    $("logs-copy").textContent = "Copied";
+    setTimeout(() => { $("logs-copy").textContent = "Copy logs"; }, 1200);
+  } catch (e) { $("logs-copy").textContent = "Copy unavailable"; }
+});
+async function loadHistory() {
+  const h = await api("/api/history"); const box = $("hist"); box.innerHTML = "";
+  $("hist-empty").classList.toggle("d-none", h.items.length > 0);
+  h.items.forEach((it) => {
+    const col = el("div", "col"), img = el("img", "img-fluid rounded hist-thumb w-100");
+    img.src = it.url; img.loading = "lazy"; img.title = (it.prompt || "") + "\nseed " + it.seed;
+    img.addEventListener("click", () => openLb(it.url)); col.appendChild(img); box.appendChild(col);
+  });
+}
+
+function applyTheme(name) {
+  const t = CFG.themes[name] || "abyssal";
+  document.documentElement.setAttribute("data-theme", t);
+  document.documentElement.setAttribute("data-bs-theme", t === "light" ? "light" : "dark");
+  try { localStorage.setItem("igl-theme", t); } catch (e) {}
+}
+
+(async function init() {
+  CFG = await api("/api/config");
+  const ts = $("theme"); Object.keys(CFG.themes).forEach((n) => { const o = el("option", null, n); o.value = n; ts.appendChild(o); });
+  let cur = document.documentElement.getAttribute("data-theme");
+  Object.keys(CFG.themes).forEach((n) => { if (CFG.themes[n] === cur) ts.value = n; });
+  ts.addEventListener("change", () => applyTheme(ts.value));
+  CFG.quants.forEach((q) => { const o = el("option", null, q); o.value = q; $("quant").appendChild(o); });
+  CFG.samplers.forEach((q) => { const o = el("option", null, q); o.value = q; $("sampler").appendChild(o); });
+  CFG.families.forEach((f) => { const o = el("option", null, f.label); o.value = f.value; $("family").appendChild(o); });
+  $("negative").value = CFG.default_negative;
+  $("token-note").textContent = CFG.has_token ? "A saved token is in use; paste one here to override it." : "Optional. Public ungated models download without accepting a licence; token is used only for authenticated Hub access.";
+  fillModels(CFG.models, CFG.default_model); $("model").value = CFG.default_model;
+  await onModel();
+  const s = await api("/api/status");
+  if (s.running) { setRunning(true); startPolling(); } else if ((s.images || []).length) showImages(s.images);
+})();
+</script>
+</body>
+</html>
+"""
+
+
+# --------------------------------------------------------------------------- #
+# The app (runs inside the private venv)
+# --------------------------------------------------------------------------- #
+class UserError(Exception):
+    """An error whose message is meant to be shown to the user as-is."""
+
+
+def run_app(args):
+    os.environ["HF_HOME"] = str(ROOT / "hf_cache")
+    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+    os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+    os.environ["DO_NOT_TRACK"] = "1"
+    hf_token = resolve_hf_token()
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+    os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    if args.offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    import gc
+    import html as htmlmod
+    import random
+    from collections import deque
+
+    # Mirror Python stdout/stderr to a bounded in-memory buffer for the web UI,
+    # while continuing to write every byte to the original terminal streams.
+    log_lock = threading.Lock()
+    log_chunks = deque(maxlen=12000)
+
+    class TeeLogStream:
+        def __init__(self, original):
+            self.original = original
+
+        def write(self, value):
+            if value:
+                with log_lock:
+                    log_chunks.append(str(value))
+            return self.original.write(value)
+
+        def flush(self):
+            return self.original.flush()
+
+        def isatty(self):
+            return self.original.isatty()
+
+        def fileno(self):
+            return self.original.fileno()
+
+        @property
+        def encoding(self):
+            return getattr(self.original, "encoding", "utf-8")
+
+    sys.stdout = TeeLogStream(sys.stdout)
+    sys.stderr = TeeLogStream(sys.stderr)
+    print("Terminal log capture enabled (web app + original console).")
+
+    import torch
+    from diffusers import (
+        AutoencoderKL,
+        DDIMScheduler,
+        DPMSolverMultistepScheduler,
+        EulerAncestralDiscreteScheduler,
+        StableDiffusionPipeline,
+        StableDiffusionXLPipeline,
+    )
+    from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+    from PIL import Image
+    from PIL.PngImagePlugin import PngInfo
+    from tqdm.auto import tqdm as base_tqdm
+
+    for d in (MODELS_DIR, OUTPUT_DIR, STATIC_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+    have_bootstrap = ensure_bootstrap(args.offline)
+    if not torch.cuda.is_available():
+        print("WARNING: CUDA GPU not available. Generation will fail. Try --reinstall.")
+
+    DEFAULT_NEG = "blurry, lowres, bad anatomy, deformed, extra fingers, watermark, text"
+    GIB = 1024 ** 3
+
+    # ----- model catalog ---------------------------------------------------- #
+    # Families = what the GGUF transformer is, plus the base repo that supplies text encoder, VAE
+    # and configs (its transformer weights are never downloaded).
+    FAMILIES = {}  # No non-OpenRAIL GGUF catalog entries are offered in this build.
+    GGUF_CATALOG = {}
+    # Ordered by expected wall-clock speed on a GTX 1660 6GB, not by model quality.
+    # Estimates assume one image, FP16, batch=1 and the listed default resolution.
+    # SDXL uses model CPU offload; it will be slower than an all-GPU SD 1.5 run.
+    CLASSIC = {
+        "01 | SDXL Lightning 4-step | OpenRAIL++": dict(
+            kind="sdxl-lightning", repo="stabilityai/stable-diffusion-xl-base-1.0", steps=4, cfg=0.0, size=768,
+            lightning_steps=4,
+            info="FASTEST SDXL option. 4-step distilled UNet from ByteDance/SDXL-Lightning with its required Euler trailing scheduler and CFG 0. Default 768 to reduce 6GB VRAM pressure; CPU offload can make it slower than the step count suggests."),
+        "02 | RealVisXL v5.0 Lightning | SDXL | OpenRAIL++": dict(
+            kind="sdxl", repo="SG161222/RealVisXL_V5.0_Lightning", steps=5, cfg=1.5, size=768,
+            recommended_sampler="DPM++ SDE Karras",
+            info="Photorealistic distilled SDXL. The model card recommends 5 steps, CFG 1–2 and DPM++ SDE Karras. My recommended speed/quality balance for realistic portraits and photographic scenes; CPU offload still applies on 6GB."),
+        "03 | DreamShaper XL Turbo | SDXL | OpenRAIL++": dict(
+            kind="sdxl", repo="Lykon/dreamshaper-xl-turbo", steps=6, cfg=2.0, size=768,
+            info="Fast SDXL fine-tune (OpenRAIL++). The model card recommends 6 steps and CFG 2. A good speed/quality compromise for artistic, illustrative and semi-realistic images. Default 768 for 6GB VRAM; 1024 may require automatic downscaling."),
+        "04 | DreamShaper 8 | SD 1.5 | OpenRAIL-M": dict(
+            kind="sd", repo="Lykon/dreamshaper-8", steps=24, cfg=6.5, size=640,
+            info="Fast all-GPU SD 1.5 fine-tune (CreativeML OpenRAIL-M). Strong general-purpose stylised and semi-realistic images. Native training size is 512; default 640 is a compromise. Choose 512 for speed or 768 for more pixels (may look softer)."),
+        "05 | SDXL Lightning 8-step | OpenRAIL++": dict(
+            kind="sdxl-lightning", repo="stabilityai/stable-diffusion-xl-base-1.0", steps=8, cfg=0.0, size=768,
+            lightning_steps=8,
+            info="Higher-step SDXL Lightning variant. Usually takes longer than 4-step but can improve detail and stability. Uses the matching 8-step distilled UNet and Euler trailing scheduler; CFG 0."),
+        "06 | Realistic Vision v6.0 | SDXL | OpenRAIL-M": dict(
+            kind="sdxl", repo="stablediffusionapi/realistic-vision-v6.0", steps=28, cfg=5.5, size=768,
+            info="Photorealistic SDXL fine-tune (CreativeML OpenRAIL-M). More natural-looking people and photographic scenes than fast distilled models, but much slower on 6GB because SDXL components are CPU-offloaded. Default 768; 1024 may downscale."),
+        "07 | RealVisXL v5.0 | SDXL | OpenRAIL++": dict(
+            kind="sdxl", repo="SG161222/RealVisXL_V5.0", steps=30, cfg=5.0, size=768,
+            info="Photorealism-focused SDXL checkpoint (OpenRAIL++). A strong choice for realistic portraits, people and camera-like scenes. Large download; SDXL CPU offload on 6GB makes it slow. Start at 768."),
+    }
+    G_CAT, G_FILE, G_CLS, G_LOC = "[GGUF] ", "[GGUF file] ", "[Classic] ", "[local] "
+    G_SDC = "[sd.cpp] "
+    SDC_MODEL_LABEL = "RealVisXL v5.0 Lightning GGUF (Q4_K_S) | stable-diffusion.cpp"
+    SDC_MODEL = dict(
+        kind="sdcpp", repo="off-grid-ai/realvisxl-v5.0-lightning-GGUF",
+        filename="realvisxl-v5.0-lightning-Q4_K_S.gguf", steps=6, cfg=1.5, size=768,
+        info="RealVisXL Lightning quantised GGUF, executed by stable-diffusion.cpp. First generation downloads the Windows engine and ~2.8 GB model. Recommended for GTX 1660 6GB: 768px, 6 steps, CFG 1.5, Euler, CUDA compute with CPU parameter residency.")
+    # best quality first; Auto walks this list
+    QUANTS = ["Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q4_K_M", "Q4_K_S", "Q4_0", "Q3_K_M", "Q3_K_S", "Q2_K"]
+    QUANT_FALLBACK = ["Q4_K_M", "Q4_K_S", "Q4_0", "Q3_K_M", "Q3_K_S", "Q2_K", "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0"]
+    MEM_LEVELS = ["gpu", "balanced", "partial"]
+
+    SAMPLERS = {
+        "DPM++ 2M Karras": lambda c: DPMSolverMultistepScheduler.from_config(
+            c, algorithm_type="dpmsolver++", solver_order=2, use_karras_sigmas=True, final_sigmas_type="sigma_min"),
+        "DPM++ SDE Karras": lambda c: DPMSolverMultistepScheduler.from_config(
+            c, algorithm_type="sde-dpmsolver++", solver_order=2, use_karras_sigmas=True),
+        "Euler a": lambda c: EulerAncestralDiscreteScheduler.from_config(c),
+        "DDIM": lambda c: DDIMScheduler.from_config(c),
+    }
+
+    state = {"pipe": None, "key": None, "plan": None, "esc": {}, "scale": {}, "force_prec": {}, "file_cache": {}}
+    job = {"running": False, "progress": 0.0, "message": "Ready.", "images": [], "error": None, "stop": False}
+    job_lock = threading.Lock()
+
+    def setmsg(progress=None, message=None):
+        with job_lock:
+            if progress is not None:
+                job["progress"] = max(0.0, min(1.0, float(progress)))
+            if message is not None:
+                job["message"] = message
+
+    # ----- model discovery -------------------------------------------------- #
+    def local_gguf_files():
+        return sorted(p for p in MODELS_DIR.glob("*.gguf") if p.is_file())
+
+    def model_list():
+        out = [dict(group="GGUF via stable-diffusion.cpp (recommended)", label=SDC_MODEL_LABEL, value=G_SDC + SDC_MODEL_LABEL)]
+        out += [dict(group="OpenRAIL models (Diffusers GGUF)", label=n, value=G_CAT + n) for n in GGUF_CATALOG]
+        out += [dict(group="Classic safetensors (not GGUF)", label=n, value=G_CLS + n) for n in CLASSIC]
+        out += [dict(group="Local checkpoints (.safetensors)", label=p.name, value=G_LOC + p.name)
+                for p in sorted(MODELS_DIR.glob("*.safetensors"))]
+        return out
+
+    def guess_family(path: Path):
+        n = path.name.lower()
+        if any(t in n for t in ("z_image", "z-image", "zimage")):
+            return "zimage"
+        if "klein" in n or re.search(r"flux[-_.]?2", n):
+            return "flux2-9b" if "9b" in n else "flux2-4b"
+        if "schnell" in n:
+            return "flux1-schnell"
+        if "flux" in n:
+            return "flux1-dev"
+        try:  # fall back to the architecture string stored in the GGUF header
+            from gguf import GGUFReader
+            f = GGUFReader(str(path)).fields.get("general.architecture")
+            arch = bytes(f.parts[f.data[0]]).decode("utf-8", "ignore").lower()
+            if arch in ("lumina2", "z_image", "zimage"):
+                return "zimage"
+            if arch == "flux":
+                return "flux1-dev"
+            if arch in ("sd1", "sdxl", "unet"):
+                raise UserError("That GGUF is a UNet model (SD 1.5 / SDXL). diffusers can't load those; "
+                                "use the safetensors version or stable-diffusion.cpp.")
+        except UserError:
+            raise
+        except Exception:
+            pass
+        return None
+
+    def get_spec(choice, force_sdxl=False, family="auto"):
+        if choice.startswith(G_SDC):
+            return dict(SDC_MODEL, gguf=False, local_gguf=False, gated=False, info=SDC_MODEL["info"])
+        if choice.startswith(G_CAT):
+            name = choice[len(G_CAT):]
+            if name not in GGUF_CATALOG:
+                raise UserError("Unknown model. Press Refresh models.")
+            c = GGUF_CATALOG[name]
+            fam = FAMILIES[c["family"]]
+            return dict(kind="gguf", family=c["family"], gguf_repo=c["repo"], steps=fam["steps"], cfg=fam["cfg"],
+                        size=fam["size"], gated=fam["gated"], info=fam["info"], gguf=True, local_gguf=False)
+        if choice.startswith(G_FILE):
+            path = MODELS_DIR / Path(choice[len(G_FILE):]).name
+            if not path.exists():
+                raise UserError("That GGUF file is gone. Press Refresh models.")
+            fid = family if family in FAMILIES else guess_family(path)
+            if not fid:
+                raise UserError("Couldn't tell which model family this GGUF is. Pick one under Advanced > "
+                                "GGUF family.")
+            fam = FAMILIES[fid]
+            return dict(kind="gguf", family=fid, gguf_file=str(path), steps=fam["steps"], cfg=fam["cfg"],
+                        size=fam["size"], gated=fam["gated"], gguf=True, local_gguf=True,
+                        info=f"Local GGUF file, treated as **{fam['label']}**. " + fam["info"])
+        if choice.startswith(G_CLS):
+            key = choice[len(G_CLS):]
+            if key not in CLASSIC:
+                raise UserError("Unknown model. Press Refresh models.")
+            spec = dict(CLASSIC[key], gguf=False, local_gguf=False, gated=False)
+            if force_sdxl and spec["kind"] == "sd":
+                spec["kind"] = "sdxl"
+            return spec
+        if choice.startswith(G_LOC):
+            name = Path(choice[len(G_LOC):]).name
+            xl = force_sdxl or any(t in name.lower() for t in ("xl", "pony", "illustrious"))
+            return dict(kind="sdxl" if xl else "sd", file=str(MODELS_DIR / name), steps=28, cfg=7.0,
+                        size=768 if xl else 512, gated=False, gguf=False, local_gguf=False,
+                        info="Local safetensors checkpoint. Tick 'Treat as SDXL' under Advanced if it is SDXL-based.")
+        raise UserError("Unknown model. Press Refresh models.")
+
+    def default_precision(spec):
+        # GTX 1660 (Turing, SM 7.5) supports FP16 but not native BF16.
+        return "fp16"
+
+    # ----- downloads -------------------------------------------------------- #
+    def make_tqdm(label_prefix):
+        class PTqdm(base_tqdm):
+            def update(self, n=1):
+                out = super().update(n)
+                try:
+                    if self.total:
+                        label = (self.desc or "files").strip()[:40]
+                        setmsg(min(self.n / self.total, 1.0) * 0.9, f"{label_prefix}: {label}")
+                except Exception:
+                    pass
+                return out
+        return PTqdm
+
+    def ensure_repo(repo, token=None, fp16_variant=False, skip_transformer=False):
+        tag = "__base" if skip_transformer else ""
+        target = MODELS_DIR / "hf" / (repo.replace("/", "__") + tag)
+        done = target / ".localgen_complete"
+        if done.exists():
+            return target, done.read_text().strip() == "fp16"
+        if args.offline:
+            raise UserError("Offline mode: this model isn't downloaded yet. Run once without --offline.")
+        setmsg(0, f"Contacting Hugging Face for {repo} (first time only)...")
+        try:
+            files = HfApi(token=token or None).list_repo_files(repo)
+        except Exception as e:
+            raise UserError(f"Couldn't list {repo} on Hugging Face (gated repo needs a token, or no internet): {e}")
+        has_st = any(f.endswith(".safetensors") for f in files)
+        ignore = ["*.md", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.mp4", "*.onnx", "*.onnx_data", "*.msgpack",
+                  "*.h5", "*.ot", "*.pb", "*.tflite", "*openvino*", "safety_checker/*", "*.gguf"]
+        if has_st:
+            ignore += ["*.bin", "*.ckpt", "*.pt", "*.pth"]
+        if "model_index.json" in files:  # diffusers layout: skip duplicate root single-file weights
+            ignore += [f for f in files if "/" not in f and f.endswith(".safetensors")]
+        if skip_transformer:  # GGUF supplies the transformer; keep only its config.json
+            ignore += ["transformer/*.safetensors", "transformer/*.safetensors.index.json", "transformer/*.bin"]
+        kwargs = dict(repo_id=repo, local_dir=str(target), cache_dir=str(ROOT / "hf_cache"),
+                      ignore_patterns=ignore, max_workers=4, resume_download=True)
+        has_fp16 = fp16_variant and any(f.endswith(".fp16.safetensors") for f in files)
+        if has_fp16:
+            kwargs["allow_patterns"] = ["*.json", "*.txt", "*.fp16.safetensors"]
+        if token:
+            kwargs["token"] = token
+        try:
+            try:
+                snapshot_download(**kwargs, tqdm_class=make_tqdm("Downloading"))
+            except TypeError:
+                kwargs.pop("resume_download", None)
+                try:
+                    snapshot_download(**kwargs, tqdm_class=make_tqdm("Downloading"))
+                except TypeError:
+                    snapshot_download(**kwargs)
+        except Exception as e:
+            if any(t in str(e) for t in ("401", "403", "gated", "restricted")):
+                raise UserError("Hugging Face denied this download. Check whether the repository is gated or requires a licence click-through; a read token alone cannot bypass those requirements.")
+            raise UserError(f"Download failed: {e}")
+        done.write_text("fp16" if has_fp16 else "full")
+        return target, has_fp16
+
+    def gguf_dir(repo):
+        return MODELS_DIR / "gguf" / repo.replace("/", "__")
+
+    def repo_gguf_files(repo, token):
+        """{filename: size_in_bytes} for the .gguf files of a repo (falls back to what is on disk)."""
+        if repo in state["file_cache"]:
+            return state["file_cache"][repo]
+        files = {}
+        if not args.offline:
+            try:
+                info = HfApi(token=token or None).model_info(repo, files_metadata=True)
+                files = {s.rfilename: (s.size or 0) for s in info.siblings if s.rfilename.lower().endswith(".gguf")}
+            except Exception as e:
+                print(f"Couldn't list {repo}: {e}")
+        if not files and gguf_dir(repo).exists():
+            files = {str(p.relative_to(gguf_dir(repo))).replace("\\", "/"): p.stat().st_size
+                     for p in gguf_dir(repo).rglob("*.gguf")}
+        if files:
+            state["file_cache"][repo] = files
+        return files
+
+    def match_quant(files, quant):
+        pat = re.compile(rf"(?<![a-z0-9]){re.escape(quant.lower())}(?![a-z0-9])")
+        hits = [f for f in files if pat.search(Path(f).name.lower())]
+        return min(hits, key=len) if hits else None
+
+    def pick_gguf(spec, quant, budget_gb, token):
+        """Choose the file to use from the catalog repo: explicit quant, or the best that fits."""
+        files = repo_gguf_files(spec["gguf_repo"], token)
+        if not files:
+            raise UserError(f"No GGUF files found in {spec['gguf_repo']} (no internet, or the repo changed).")
+        if quant and quant != "Auto":
+            f = match_quant(files, quant)
+            if not f:
+                have = ", ".join(sorted({q for q in QUANTS if match_quant(files, q)})) or "none recognised"
+                raise UserError(f"{spec['gguf_repo']} has no {quant} file. Available: {have}.")
+            return f, files[f]
+        for q in QUANTS:  # best quality that fits fully on the GPU
+            f = match_quant(files, q)
+            if f and files[f] / GIB * 1.1 <= budget_gb:
+                return f, files[f]
+        for q in QUANT_FALLBACK:  # nothing fits: take a sensible middle quant and offload part of it
+            f = match_quant(files, q)
+            if f:
+                return f, files[f]
+        f = min(files, key=lambda k: files[k])
+        return f, files[f]
+
+    def ensure_gguf(repo, filename, token):
+        target = gguf_dir(repo)
+        path = target / filename
+        if path.exists():
+            return path
+        if args.offline:
+            raise UserError("Offline mode: this GGUF isn't downloaded yet. Run once without --offline.")
+        setmsg(0, f"Downloading {filename} (first time only)...")
+        kw = dict(repo_id=repo, filename=filename, local_dir=str(target))
+        if token:
+            kw["token"] = token
+        try:
+            try:
+                p = hf_hub_download(**kw, tqdm_class=make_tqdm("Downloading GGUF"))
+            except TypeError:
+                p = hf_hub_download(**kw)
+        except Exception as e:
+            if any(t in str(e) for t in ("401", "403", "gated", "restricted")):
+                raise UserError("Hugging Face denied this download. Check repository access and any licence requirements on its model page.")
+            raise UserError(f"GGUF download failed: {e}")
+        return Path(p)
+
+    # ----- native Windows stable-diffusion.cpp backend ----------------------- #
+    # The Python UI stays in the existing venv. The inference engine is a native
+    # Windows CUDA executable; Docker/WSL2/Git/CMake are deliberately not used.
+    SDC_REPO = "off-grid-ai/realvisxl-v5.0-lightning-GGUF"
+    SDC_FILENAME = "realvisxl-v5.0-lightning-Q4_K_S.gguf"
+    SDC_RELEASE_API = "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest"
+    SDC_BIN_DIR = SDCPP_DIR / "bin"
+    SDC_EXE = SDC_BIN_DIR / "sd-cli.exe"
+    sdc_proc_lock = threading.Lock()
+    sdc_proc = {"process": None}
+
+    def download_file(url, destination, label):
+        import urllib.request
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temp = destination.with_suffix(destination.suffix + ".part")
+        request = urllib.request.Request(url, headers={"User-Agent": "ImageGenLocal/1.0"})
+        print(f"{label}: {url}", flush=True)
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response, open(temp, "wb") as out:
+                total = int(response.headers.get("Content-Length") or 0)
+                done = 0
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    done += len(chunk)
+                    if total:
+                        print(f"[Download] {label}: {done/total:.0%} ({done/1024**2:.0f}/{total/1024**2:.0f} MiB)", flush=True)
+            temp.replace(destination)
+        except Exception:
+            temp.unlink(missing_ok=True)
+            raise
+        return destination
+
+    def ensure_sd_cpp():
+        if os.name != "nt":
+            raise UserError("This backend installer is configured for native Windows. Run the app on Windows.")
+        if SDC_EXE.exists() and (SDC_BIN_DIR / "stable-diffusion.dll").exists():
+            return str(SDC_EXE)
+        if args.offline:
+            raise UserError(f"Offline mode: native sd.cpp is not installed. Expected executable: {SDC_EXE}")
+        import json
+        import urllib.request
+        import zipfile
+        import tempfile
+
+        SDCPP_DIR.mkdir(parents=True, exist_ok=True)
+        SDC_BIN_DIR.mkdir(parents=True, exist_ok=True)
+        setmsg(0.02, "Checking official stable-diffusion.cpp Windows CUDA release ...")
+        req = urllib.request.Request(SDC_RELEASE_API, headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "ImageGenLocal/1.0",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                release = json.loads(response.read().decode("utf-8"))
+        except Exception as e:
+            raise UserError(f"Could not query the official stable-diffusion.cpp releases: {e}")
+
+        assets = release.get("assets", [])
+        exe_asset = next((a for a in assets if
+                          "bin-win-cuda12-x64.zip" in a.get("name", "").lower()
+                          and a.get("browser_download_url")), None)
+        runtime_asset = next((a for a in assets if
+                              "cudart-sd-bin-win-cu12-x64.zip" in a.get("name", "").lower()
+                              and a.get("browser_download_url")), None)
+        if not exe_asset:
+            names = "\n".join(a.get("name", "") for a in assets)
+            raise UserError(
+                "The latest official stable-diffusion.cpp release does not expose both the Windows CUDA 12 x64 executable and its matching CUDA runtime DLL package. "
+                "No Docker or source build will be attempted. Available release assets:\n" + names
+            )
+        setmsg(0.05, "Downloading native Windows CUDA engine ...")
+        with tempfile.TemporaryDirectory(prefix="sdcpp-install-") as temp_dir:
+            temp_dir = Path(temp_dir)
+            exe_zip = download_file(exe_asset["browser_download_url"], temp_dir / exe_asset["name"],
+                                    "Downloading stable-diffusion.cpp Windows CUDA binary")
+            with zipfile.ZipFile(exe_zip) as zf:
+                zf.extractall(temp_dir / "engine")
+            engine_root = temp_dir / "engine"
+            cli_candidates = list(engine_root.rglob("sd-cli.exe"))
+            if not cli_candidates:
+                cli_candidates = list(engine_root.rglob("sd.exe"))
+            if not cli_candidates:
+                raise UserError("The downloaded Windows engine archive contains no sd-cli.exe or sd.exe. The archive may be incomplete or have changed layout.")
+            cli = cli_candidates[0]
+            # Keep all release DLLs beside the executable so Windows' DLL loader can resolve them.
+            for item in cli.parent.iterdir():
+                if item.is_file():
+                    target = SDC_BIN_DIR / item.name
+                    shutil.copy2(item, target)
+            if cli.name.lower() != "sd-cli.exe":
+                shutil.copy2(cli, SDC_BIN_DIR / "sd-cli.exe")
+            else:
+                shutil.copy2(cli, SDC_EXE)
+            # Some release archives place DLLs in a sibling directory.
+            for dll in engine_root.rglob("*.dll"):
+                shutil.copy2(dll, SDC_BIN_DIR / dll.name)
+
+            if runtime_asset:
+                setmsg(0.10, "Downloading matching CUDA 12 runtime DLL package ...")
+                runtime_zip = download_file(runtime_asset["browser_download_url"],
+                                            temp_dir / runtime_asset["name"],
+                                            "Downloading CUDA runtime DLLs")
+                with zipfile.ZipFile(runtime_zip) as zf:
+                    for member in zf.infolist():
+                        if member.is_dir() or not member.filename.lower().endswith(".dll"):
+                            continue
+                        extracted = zf.extract(member, temp_dir / "runtime")
+                        shutil.copy2(extracted, SDC_BIN_DIR / Path(member.filename).name)
+
+        if not SDC_EXE.exists():
+            raise UserError(f"Native sd.cpp installation did not produce {SDC_EXE}")
+        # Verify the actual executable and Windows DLL loader before accepting install.
+        probe = subprocess.run([str(SDC_EXE), "--help"], cwd=str(SDC_BIN_DIR),
+                               capture_output=True, text=True, timeout=45,
+                               encoding="utf-8", errors="replace",
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        probe_text = (probe.stdout or "") + (probe.stderr or "")
+        if probe.returncode not in (0, 1) or "img_gen" not in probe_text.lower():
+            raise UserError(
+                "The native Windows engine was downloaded but failed its startup/CLI validation. "
+                "This is usually a missing or mismatched DLL. Full validation output:\n" + probe_text[-3000:]
+            )
+        print(f"Native stable-diffusion.cpp ready: {SDC_EXE}", flush=True)
+        print(f"Release: {release.get('tag_name', 'latest')} | CUDA 12 Windows x64", flush=True)
+        return str(SDC_EXE)
+
+    def ensure_sdc_model(token=None):
+        target = MODELS_DIR / SDC_FILENAME
+        if target.exists() and target.stat().st_size > 1_000_000_000:
+            return target
+        if args.offline:
+            raise UserError(f"Offline mode: the RealVisXL GGUF is not downloaded. Download {SDC_FILENAME} from https://huggingface.co/{SDC_REPO}/blob/main/{SDC_FILENAME} into {MODELS_DIR}.")
+        setmsg(0.23, "Downloading RealVisXL Lightning GGUF (~2.8 GB, first run only) ...")
+        try:
+            from huggingface_hub import hf_hub_download
+            downloaded = hf_hub_download(repo_id=SDC_REPO, filename=SDC_FILENAME,
+                                         local_dir=str(MODELS_DIR), token=token or None)
+            result = Path(downloaded)
+            if not result.exists() or result.stat().st_size < 1_000_000_000:
+                raise RuntimeError("downloaded GGUF file is unexpectedly small")
+            print(f"RealVisXL GGUF ready: {result} ({result.stat().st_size / 1024**3:.2f} GiB)")
+            return result
+        except Exception as e:
+            raise UserError(f"Could not download RealVisXL GGUF from Hugging Face: {e}")
+
+    def run_sdcpp_image(p, spec, seed, output_path, index, count):
+        exe = ensure_sd_cpp()
+        model = ensure_sdc_model((p.get("token") or "").strip() or hf_token or None)
+        width, height = int(p["width"]), int(p["height"])
+        width = max(512, min(1024, round(width / 64) * 64))
+        height = max(512, min(1024, round(height / 64) * 64))
+        steps = max(1, min(20, int(p.get("steps", 6))))
+        cfg = max(0.5, min(5.0, float(p.get("cfg", 1.5))))
+        prompt = (p.get("prompt") or "").strip()
+        negative = (p.get("negative") or "").strip()
+        command = [exe, "-M", "img_gen", "-m", str(model), "-p", prompt,
+                   "-o", str(output_path), "-W", str(width), "-H", str(height),
+                   "--steps", str(steps), "--cfg-scale", str(cfg),
+                   "--sampling-method", "euler", "--seed", str(seed),
+                   "--backend", "cuda", "--params-backend", "cpu"]
+        if negative:
+            command += ["-n", negative]
+        print("Launching native Windows sd.cpp:", subprocess.list2cmdline(command), flush=True)
+        setmsg((index / count), f"Image {index + 1}/{count} | starting native stable-diffusion.cpp ...")
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        proc = subprocess.Popen(command, cwd=str(SDC_BIN_DIR), stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+                                bufsize=1, creationflags=creationflags)
+        with sdc_proc_lock:
+            sdc_proc["process"] = proc
+        started = time.time()
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    print("[sd.cpp] " + line, flush=True)
+                    match = re.search(r"(?:step\s*)?(\d{1,3})\s*%", line, re.I)
+                    if match:
+                        pct = max(0, min(100, int(match.group(1)))) / 100
+                        setmsg((index + pct) / count, f"Image {index + 1}/{count} | sd.cpp {pct:.0%} | {time.time()-started:.0f}s")
+                    else:
+                        step_match = re.search(r"(?:step|sample|sampling)[^0-9]*(\d+)\s*/\s*(\d+)", line, re.I)
+                        if step_match and int(step_match.group(2)) > 0:
+                            pct = max(0.0, min(1.0, int(step_match.group(1)) / int(step_match.group(2))))
+                            setmsg((index + pct) / count, f"Image {index + 1}/{count} | sd.cpp step {step_match.group(1)}/{step_match.group(2)}")
+                if job["stop"] and proc.poll() is None:
+                    proc.terminate()
+            code = proc.wait()
+        finally:
+            with sdc_proc_lock:
+                sdc_proc["process"] = None
+        if job["stop"]:
+            return None
+        if code != 0:
+            raise UserError(f"Native stable-diffusion.cpp failed (exit {code}). See Terminal logs for the full error.")
+        if not output_path.exists():
+            matches = sorted(output_path.parent.glob(output_path.stem + "*.png"),
+                             key=lambda x: x.stat().st_mtime, reverse=True)
+            if matches:
+                matches[0].replace(output_path)
+        if not output_path.exists() or output_path.stat().st_size < 1000:
+            raise UserError("sd.cpp finished without producing the expected PNG. See Terminal logs.")
+        return Image.open(output_path).convert("RGB")
+
+    def generate_sdcpp(p, spec):
+        prompt = (p.get("prompt") or "").strip()
+        if not prompt:
+            raise UserError("Type a prompt first.")
+        count = max(1, min(8, int(p.get("count", 1))))
+        seed_in = int(p.get("seed", -1))
+        base_seed = seed_in if seed_in >= 0 else random.randint(0, 2**31 - 1)
+        steps = max(1, min(20, int(p.get("steps", spec["steps"]))))
+        cfg = float(p.get("cfg", spec["cfg"]))
+        started = time.time()
+        print(f"Using native stable-diffusion.cpp CUDA | RealVisXL Lightning GGUF | {p.get('width')}x{p.get('height')} | {steps} steps | CFG {cfg}", flush=True)
+        for i in range(count):
+            if job["stop"]:
+                break
+            seed = (base_seed + i) % (2**31 - 1)
+            name = f"{time.strftime('%Y%m%d_%H%M%S')}_{seed}.png"
+            output_path = OUTPUT_DIR / name
+            img = run_sdcpp_image(p, spec, seed, output_path, i, count)
+            if img is None or job["stop"]:
+                break
+            meta = PngInfo()
+            for key, value in (("prompt", prompt), ("negative_prompt", p.get("negative", "")),
+                               ("seed", seed), ("model", SDC_MODEL_LABEL), ("backend", "stable-diffusion.cpp"),
+                               ("steps", steps), ("cfg", cfg), ("resolution", f"{p['width']}x{p['height']}"),
+                               ("quantization", "Q4_K"), ("compute_backend", "CUDA (native Windows)"), ("parameter_backend", "CPU")):
+                meta.add_text(key, str(value))
+            # Rewrite with app metadata while retaining the decoded pixels.
+            img.save(output_path, format="PNG", pnginfo=meta)
+            with job_lock:
+                job["images"].append(dict(url=f"/outputs/{name}", name=name, seed=seed))
+        msg = f"{'Stopped. ' if job['stop'] else 'Done. '}{len(job['images'])} image(s) in {time.time()-started:.0f}s | native stable-diffusion.cpp CUDA backend"
+        setmsg(1.0 if not job["stop"] else None, msg)
+
+    # ----- pipeline management ---------------------------------------------- #
+    def unload():
+        state["pipe"] = None
+        state["key"] = None
+        state["plan"] = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def torch_dtype(prec):
+        if prec == "bf16":
+            raise UserError("BF16 is not supported natively by the GTX 1660. Select FP16 or Auto.")
+        return torch.float32 if prec == "fp32" else torch.float16
+
+    def vram_free_gb():
+        try:
+            return torch.cuda.mem_get_info()[0] / GIB
+        except Exception:
+            return 0.0
+
+    def choose_level(requested, gguf_gb, te_gb, free_gb):
+        if requested in MEM_LEVELS:
+            return MEM_LEVELS.index(requested)
+        if free_gb >= gguf_gb * 1.1 + te_gb + 1.5:
+            return 0
+        if free_gb >= gguf_gb * 1.1 + 1.3:
+            return 1
+        return 2
+
+    def place(pipe, level, gguf_gb, free_gb, scale):
+        """Put the pipeline on the GPU, offloading only what is needed. Returns a description."""
+        cuda = torch.device("cuda")
+        if level == 0:
+            try:
+                pipe.to("cuda")
+                return "all on GPU"
+            except Exception as e:
+                print(f"pipe.to(cuda) failed ({e}); using balanced offload instead")
+                level = 1
+        if level == 1:
+            pipe.enable_model_cpu_offload()
+            return "balanced offload (transformer on GPU while sampling)"
+        # partial: text encoder / VAE swap in and out; transformer blocks are paged so only what fits stays on GPU
+        tr = pipe.transformer
+        n_blocks = max((len(m) for m in tr.children() if isinstance(m, torch.nn.ModuleList)), default=0)
+        try:
+            if n_blocks < 2:
+                raise RuntimeError("no block list to page")
+            pipe._exclude_from_cpu_offload = ["transformer"]
+            pipe.enable_model_cpu_offload()
+            budget = max(free_gb - 1.6, 0.4)
+            frac = min(1.0, budget / (gguf_gb * 1.1))
+            per = max(1, int(n_blocks * frac * 0.6 * scale))
+            tr.enable_group_offload(onload_device=cuda, offload_device=torch.device("cpu"),
+                                    offload_type="block_level", num_blocks_per_group=per, use_stream=False)
+            return f"partial offload ({per} of {n_blocks} transformer blocks on the GPU at a time)"
+        except Exception as e:
+            print(f"Partial offload failed ({e}); falling back to sequential offload")
+            try:
+                pipe.remove_all_hooks()
+            except Exception:
+                pass
+            pipe._exclude_from_cpu_offload = []
+            pipe.enable_sequential_cpu_offload()
+            return "sequential offload (layer by layer)"
+
+    def load_gguf(spec, choice, p, token, prec):
+        if not torch.cuda.is_available():
+            raise UserError("GGUF models run on the GPU, but PyTorch can't see one. Try --reinstall.")
+        try:
+            import gguf  # noqa: F401
+            from diffusers import GGUFQuantizationConfig
+        except ImportError as e:
+            raise UserError(f"GGUF support is missing. Run with --reinstall to install it. ({e})")
+        fam = FAMILIES[spec["family"]]
+        try:
+            import diffusers as dz
+            if fam["kind"] == "zimage":
+                pipe_cls, tr_cls = dz.ZImagePipeline, dz.ZImageTransformer2DModel
+            elif fam["kind"] == "flux2":
+                pipe_cls, tr_cls = dz.Flux2KleinPipeline, dz.Flux2Transformer2DModel
+            else:
+                pipe_cls, tr_cls = dz.FluxPipeline, dz.FluxTransformer2DModel
+        except AttributeError as e:
+            raise UserError(f"Your diffusers is too old for {fam['label']}. Run with --reinstall. ({e})")
+
+        dtype = torch_dtype(prec)
+        unload()  # measure free VRAM with nothing of ours loaded
+        free_gb = vram_free_gb()
+        req = p.get("memory", "auto")
+
+        if "gguf_file" in spec:
+            gguf_path = Path(spec["gguf_file"])
+            gguf_gb = gguf_path.stat().st_size / GIB
+            fname = gguf_path.name
+        else:
+            # budget for the best-fitting quant: transformer alone must fit (text encoder swaps out)
+            budget = free_gb - 1.5 if req != "gpu" else free_gb - fam["te_gb"] - 1.2
+            fname, size = pick_gguf(spec, p.get("quant"), budget, token)
+            gguf_gb = size / GIB
+            gguf_path = None
+
+        level = choose_level(req, gguf_gb, fam["te_gb"], free_gb)
+        level = max(level, state["esc"].get(choice, 0))
+        scale = state["scale"].get(choice, 1.0)
+        key = (choice, fname, prec, level, round(scale, 3))
+        if state["pipe"] is not None and state["key"] == key:
+            return state["pipe"], state["plan"]
+
+        if gguf_path is None:
+            gguf_path = ensure_gguf(spec["gguf_repo"], fname, token)
+        base, _ = ensure_repo(fam["base"], token=token, skip_transformer=True)
+
+        setmsg(0.93, f"Loading {fname} (GGUF) ...")
+        qcfg = GGUFQuantizationConfig(compute_dtype=dtype)
+        try:
+            transformer = tr_cls.from_single_file(str(gguf_path), config=str(base), subfolder="transformer",
+                                                  quantization_config=qcfg, torch_dtype=dtype)
+        except Exception as first:
+            try:  # let diffusers infer the config instead
+                transformer = tr_cls.from_single_file(str(gguf_path), quantization_config=qcfg, torch_dtype=dtype)
+            except Exception:
+                raise UserError(f"Couldn't load the GGUF transformer: {first}")
+
+        kw = dict(transformer=transformer, torch_dtype=dtype)
+        te_bf16 = fam["te_gb"] * 3.3
+        if not (free_gb >= gguf_gb * 1.1 + te_bf16 + 1.5):  # 4-bit text encoder unless VRAM is plentiful
+            try:
+                from diffusers import PipelineQuantizationConfig
+                kw["quantization_config"] = PipelineQuantizationConfig(
+                    quant_backend="bitsandbytes_4bit",
+                    quant_kwargs={"load_in_4bit": True, "bnb_4bit_quant_type": "nf4",
+                                  "bnb_4bit_compute_dtype": dtype, "bnb_4bit_use_double_quant": True},
+                    components_to_quantize=fam["quant_components"])
+            except ImportError as e:
+                raise UserError(f"This diffusers has no PipelineQuantizationConfig; run with --reinstall. ({e})")
+        setmsg(0.96, "Loading text encoder and VAE ...")
+        pipe = pipe_cls.from_pretrained(str(base), **kw)
+        try:
+            pipe.vae.enable_tiling()
+        except Exception:
+            pass
+        plan = place(pipe, level, gguf_gb, free_gb, scale)
+        plan = f"{Path(fname).name} | {plan}"
+        pipe._lg_level = level
+        state["pipe"], state["key"], state["plan"] = pipe, key, plan
+        return pipe, plan
+
+    def load_sd(spec, prec, token=None):
+        sdxl = spec["kind"] in ("sdxl", "sdxl-lightning")
+        dtype = torch_dtype(prec)
+        cls = StableDiffusionXLPipeline if sdxl else StableDiffusionPipeline
+        extra = {}
+        if not sdxl:
+            extra.update(safety_checker=None, requires_safety_checker=False)
+
+        if spec["kind"] == "sdxl-lightning":
+            # The Lightning repo is a distilled UNet checkpoint, not a standalone pipeline.
+            from diffusers import AutoencoderKL, EulerDiscreteScheduler, UNet2DConditionModel
+            from safetensors.torch import load_file
+            base_path, _ = ensure_repo(spec["repo"], token=token, fp16_variant=True)
+            setmsg(0.88, "Loading SDXL VAE in FP32 to prevent FP16 decode overflow...")
+            vae_kw = {"torch_dtype": torch.float32}
+            if (base_path / "vae" / "diffusion_pytorch_model.fp16.safetensors").exists():
+                vae_kw["variant"] = "fp16"
+            vae = AutoencoderKL.from_pretrained(str(base_path), subfolder="vae", **vae_kw)
+            setmsg(0.90, f"Preparing SDXL Lightning {int(spec.get('lightning_steps', 4))}-step UNet...")
+            unet = UNet2DConditionModel.from_config(str(base_path / "unet"))
+            checkpoint = hf_hub_download(
+                repo_id="ByteDance/SDXL-Lightning",
+                filename=f"sdxl_lightning_{int(spec.get('lightning_steps', 4))}step_unet.safetensors",
+                token=token or None,
+                cache_dir=str(ROOT / "hf_cache"),
+            )
+            weights = load_file(checkpoint, device="cpu")
+            missing, unexpected = unet.load_state_dict(weights, strict=True)
+            del weights
+            if missing or unexpected:
+                raise UserError(f"Lightning UNet weights did not match (missing={len(missing)}, unexpected={len(unexpected)}). Update diffusers and retry.")
+            unet.to(dtype=dtype)
+            setmsg(0.95, "Loading SDXL base components...")
+            kw = dict(unet=unet, vae=vae, torch_dtype=dtype, use_safetensors=True)
+            if (base_path / "unet" / "diffusion_pytorch_model.fp16.safetensors").exists():
+                kw["variant"] = "fp16"
+            pipe = StableDiffusionXLPipeline.from_pretrained(str(base_path), **kw)
+            pipe.scheduler = EulerDiscreteScheduler.from_config(
+                pipe.scheduler.config, timestep_spacing="trailing")
+        else:
+            if "repo" in spec:
+                path, has_fp16 = ensure_repo(spec["repo"], token=token, fp16_variant=True)
+                setmsg(0.94, "Loading model into memory...")
+                kw = dict(torch_dtype=dtype, use_safetensors=True, **extra)
+                if has_fp16:
+                    kw["variant"] = "fp16"
+                if sdxl:
+                    from diffusers import AutoencoderKL
+                    setmsg(0.91, "Loading SDXL VAE in FP32 to prevent FP16 decode overflow...")
+                    vae_kw = {"torch_dtype": torch.float32}
+                    if (path / "vae" / "diffusion_pytorch_model.fp16.safetensors").exists():
+                        vae_kw["variant"] = "fp16"
+                    kw["vae"] = AutoencoderKL.from_pretrained(
+                        str(path), subfolder="vae", **vae_kw
+                    )
+                pipe = cls.from_pretrained(str(path), **kw)
+            else:
+                setmsg(0.5, "Loading checkpoint file into memory...")
+                pipe = cls.from_single_file(spec["file"], torch_dtype=dtype, **extra)
+
+        pipe._lg_cfg = pipe.scheduler.config
+        try:
+            pipe.enable_attention_slicing("max")
+        except Exception:
+            pipe.enable_attention_slicing()
+        try:
+            pipe.enable_vae_tiling()
+        except Exception:
+            pass
+        # Keep the SDXL VAE in FP32. Passing torch_dtype=FP16 to the pipeline
+        # constructor can cast an explicitly supplied FP32 VAE back to FP16.
+        # Re-assert FP32 AFTER pipeline construction, before installing offload hooks.
+        # SDXL's UNet/text encoders remain FP16 to limit GTX 1660 VRAM use.
+        if sdxl:
+            pipe.vae.to(dtype=torch.float32)
+            vae_dtypes = {p.dtype for p in pipe.vae.parameters()}
+            if vae_dtypes != {torch.float32}:
+                raise UserError(f"SDXL VAE did not remain FP32 (found dtypes: {vae_dtypes}).")
+
+            # SDXL pipeline may pass FP16 latents to an FP32 VAE. Convert only
+            # the decoder input; all VAE parameters remain consistently FP32.
+            try:
+                def _cast_vae_input_to_param_dtype(module, inputs):
+                    if inputs and torch.is_tensor(inputs[0]):
+                        target_dtype = module.weight.dtype
+                        if inputs[0].dtype != target_dtype:
+                            return (inputs[0].to(dtype=target_dtype), *inputs[1:])
+                    return inputs
+                pipe.vae.post_quant_conv.register_forward_pre_hook(
+                    _cast_vae_input_to_param_dtype
+                )
+            except Exception as e:
+                print(f"Could not install SDXL VAE dtype compatibility hook: {e}")
+            print("SDXL VAE parameter dtype:", sorted(str(d) for d in vae_dtypes))
+
+            # Temporary diagnostics: identify whether non-finite values originate
+            # in the denoising latents or during VAE decoding. This wrapper does
+            # not modify tensors or their dtypes.
+            _original_vae_decode = pipe.vae.decode
+            def _diagnostic_vae_decode(z, *args, **kwargs):
+                try:
+                    z_finite = bool(torch.isfinite(z).all().item())
+                    z_min = float(torch.nan_to_num(z.detach()).min().item())
+                    z_max = float(torch.nan_to_num(z.detach()).max().item())
+                    print(f"SDXL diagnostic | VAE input: dtype={z.dtype}, finite={z_finite}, range=[{z_min:.6g}, {z_max:.6g}]")
+                except Exception as diag_error:
+                    print(f"SDXL diagnostic | VAE input check failed: {diag_error}")
+                decoded = _original_vae_decode(z, *args, **kwargs)
+                try:
+                    sample = decoded[0] if isinstance(decoded, tuple) else decoded.sample
+                    finite = bool(torch.isfinite(sample).all().item())
+                    clean = torch.nan_to_num(sample.detach())
+                    print(f"SDXL diagnostic | VAE output: dtype={sample.dtype}, finite={finite}, range=[{float(clean.min().item()):.6g}, {float(clean.max().item()):.6g}]")
+                except Exception as diag_error:
+                    print(f"SDXL diagnostic | VAE output check failed: {diag_error}")
+                return decoded
+            pipe.vae.decode = _diagnostic_vae_decode
+            pipe.enable_model_cpu_offload()
+        else:
+            pipe.to("cuda")
+        return pipe
+
+    def load_pipe(choice, p, token):
+        spec = get_spec(choice, p.get("force_sdxl", False), p.get("family", "auto"))
+        prec = p.get("precision", "auto")
+        prec = prec if prec != "auto" else default_precision(spec)
+        prec = state["force_prec"].get(choice, prec)
+        if spec["kind"] == "gguf":
+            pipe, plan = load_gguf(spec, choice, p, token, prec)
+            pipe.set_progress_bar_config(disable=True)
+            return pipe, spec, prec, plan
+        key = (choice, spec["kind"], prec)
+        if state["pipe"] is not None and state["key"] == key:
+            return state["pipe"], spec, prec, state["plan"]
+        unload()
+        pipe = load_sd(spec, prec, token)
+        pipe.set_progress_bar_config(disable=True)
+        state["pipe"], state["key"], state["plan"] = pipe, key, "on GPU"
+        return pipe, spec, prec, "on GPU"
+
+    def looks_black(img):
+        return max(img.convert("L").getextrema()) < 8
+
+    # ----- generation ------------------------------------------------------- #
+    def generate(p):
+        prompt = (p.get("prompt") or "").strip()
+        if not prompt:
+            raise UserError("Type a prompt first.")
+        choice = p.get("model", "")
+        steps, count = int(p["steps"]), max(1, min(8, int(p["count"])))
+        width, height = int(p["width"]), int(p["height"])
+        cfg = float(p["cfg"])
+        negative = p.get("negative") or ""
+        sampler = p.get("sampler") if p.get("sampler") in SAMPLERS else "Euler a"
+        token = (p.get("token") or "").strip() or hf_token or None
+        t_all = time.time()
+        notes = []
+
+        try:
+            selected_spec = get_spec(choice, p.get("force_sdxl", False), p.get("family", "auto"))
+            if selected_spec["kind"] == "sdcpp":
+                return generate_sdcpp(p, selected_spec)
+            pipe, spec, prec, plan = load_pipe(choice, p, token)
+            sampler = spec.get("recommended_sampler") or sampler
+        except UserError:
+            raise
+        except torch.cuda.OutOfMemoryError:
+            unload()
+            raise UserError("Out of GPU memory while loading. Set Memory to 'Partial offload' or pick a smaller "
+                            "quantization.")
+        except Exception as e:
+            unload()
+            traceback.print_exc()
+            raise UserError(f"Could not load the model: {e}")
+        notes.append(plan)
+
+        try:
+            seed_in = int(p.get("seed", -1))
+        except Exception:
+            seed_in = -1
+        base_seed = seed_in if seed_in >= 0 else random.randint(0, 2 ** 32 - 1)
+        torch.cuda.reset_peak_memory_stats()
+
+        for i in range(count):
+            if job["stop"]:
+                break
+            s = (base_seed + i) % (2 ** 32)
+            clock = [time.time()]
+
+            def on_step(pp, step, timestep, kw, i=i, clock=clock):
+                latents = kw.get("latents") if isinstance(kw, dict) else None
+                if torch.is_tensor(latents):
+                    try:
+                        finite = bool(torch.isfinite(latents).all().item())
+                        clean = torch.nan_to_num(latents.detach())
+                        print(f"SDXL diagnostic | denoise step {step + 1}: finite={finite}, range=[{float(clean.min().item()):.6g}, {float(clean.max().item()):.6g}]")
+                    except Exception as diag_error:
+                        print(f"SDXL diagnostic | latent check failed: {diag_error}")
+                done = step + 1
+                el = max(time.time() - clock[0], 1e-6)
+                rate = done / el
+                eta = (steps - done) / rate if rate else 0
+                setmsg((i + done / steps) / count,
+                       f"Image {i + 1}/{count} | step {done}/{steps} | {rate:.2f} it/s | ~{eta:.0f}s left")
+                if job["stop"]:
+                    pp._interrupt = True
+                return kw
+
+            def render(pp, spec, s=s, on_step=on_step, clock=clock):
+                clock[0] = time.time()
+                gen = torch.Generator("cuda").manual_seed(s)
+                call = dict(prompt=prompt, num_inference_steps=steps, guidance_scale=cfg, width=width,
+                            height=height, generator=gen, callback_on_step_end=on_step)
+                neg = negative.strip()
+                if spec["kind"] == "sdxl-lightning":
+                    # Lightning 4-step requires Euler with trailing timestep spacing and CFG=0.
+                    call["guidance_scale"] = 0.0
+                elif spec["kind"] in ("sd", "sdxl"):
+                    try:
+                        pp.scheduler = SAMPLERS[sampler](pp._lg_cfg)
+                    except Exception as e:
+                        print(f"Sampler '{sampler}' failed ({e}); falling back to Euler a.")
+                        pp.scheduler = SAMPLERS["Euler a"](pp._lg_cfg)
+                    call["negative_prompt"] = neg or None
+                elif spec.get("family") == "zimage" and neg and cfg > 1:
+                    call["negative_prompt"] = neg
+                pp._interrupt = False
+                setmsg(i / count, f"Image {i + 1}/{count} | encoding prompt, starting ...")
+                try:
+                    return pp(**call).images[0]
+                except TypeError as e:
+                    if "callback_on_step_end" in str(e):
+                        call.pop("callback_on_step_end")
+                        return pp(**call).images[0]
+                    raise
+
+            attempts = 0
+            while True:
+                try:
+                    img = render(pipe, spec)
+                    if not job["stop"] and looks_black(img):
+                        # Do not try BF16 on Turing/GTX 1660; only classic SD pipelines get an FP32 retry.
+                        retry = "fp32" if prec == "fp16" and spec["kind"] in ("sd", "sdxl") else None
+                        if retry:
+                            setmsg(i / count, f"Black image with {prec}. Reloading in {retry} ...")
+                            state["force_prec"][choice] = retry
+                            notes.append(f"switched to {retry} automatically")
+                            pipe, spec, prec, plan = load_pipe(choice, p, token)
+                            img = render(pipe, spec)
+                    break
+                except torch.cuda.OutOfMemoryError:
+                    attempts += 1
+                    if spec["kind"] == "gguf":
+                        if attempts > 3:
+                            unload()
+                            raise UserError("Out of GPU memory. Lower resolution or select a smaller GGUF quantization.")
+                        lvl = getattr(pipe, "_lg_level", 0)
+                        if lvl < 2:
+                            state["esc"][choice] = lvl + 1
+                        else:
+                            state["scale"][choice] = state["scale"].get(choice, 1.0) * 0.5
+                        setmsg(i / count, "Out of GPU memory, offloading more to CPU and retrying ...")
+                    else:
+                        if attempts > 2 or min(width, height) <= 640:
+                            unload()
+                            raise UserError("Out of GPU memory even after automatic downscaling. Try 640px or choose DreamShaper 8.")
+                        new_w = max(640, int((width * 0.75) // 64) * 64)
+                        new_h = max(640, int((height * 0.75) // 64) * 64)
+                        width, height = new_w, new_h
+                        setmsg(i / count, f"VRAM limit reached; retrying at {width}x{height}...")
+                    unload()
+                    try:
+                        pipe, spec, prec, plan = load_pipe(choice, p, token)
+                    except UserError:
+                        raise
+                    except Exception as e:
+                        unload()
+                        raise UserError(f"Could not reload after memory adjustment: {e}")
+                    notes.append(f"memory fallback at {width}x{height} -> {plan}")
+                except UserError:
+                    raise
+                except Exception as e:
+                    traceback.print_exc()
+                    raise UserError(f"Generation failed: {e}")
+
+            if job["stop"]:
+                break
+
+            meta = PngInfo()
+            for k, v in (("prompt", prompt), ("negative_prompt", negative), ("seed", s), ("model", choice),
+                         ("steps", steps), ("cfg", cfg), ("resolution", f"{width}x{height}"), ("precision", prec),
+                         ("memory_plan", plan)):
+                meta.add_text(k, str(v))
+            name = f"{time.strftime('%Y%m%d_%H%M%S')}_{s}.png"
+            img.save(OUTPUT_DIR / name, pnginfo=meta)
+            with job_lock:
+                job["images"].append(dict(url=f"/outputs/{name}", name=name, seed=s))
+
+        peak = torch.cuda.max_memory_allocated() / GIB
+        msg = (f"{'Stopped. ' if job['stop'] else 'Done. '}{len(job['images'])} image(s) in "
+               f"{time.time() - t_all:.0f}s | peak VRAM {peak:.1f} GB | {'; '.join(dict.fromkeys(notes))}")
+        setmsg(1.0 if not job["stop"] else None, msg)
+        torch.cuda.empty_cache()
+
+    def job_thread(p):
+        try:
+            generate(p)
+        except UserError as e:
+            with job_lock:
+                job["error"] = str(e)
+        except Exception as e:
+            traceback.print_exc()
+            with job_lock:
+                job["error"] = f"Unexpected error: {e}"
+        finally:
+            with job_lock:
+                job["running"] = False
+
+    # ----- HTTP API --------------------------------------------------------- #
+    THEMES = {"Abyssal Storm": "abyssal", "Forest Moss": "forest", "Cocoa Zen": "cocoa",
+              "Complete Dark": "dark", "Light Parchment": "light"}
+    default_theme = {"dark": "abyssal", "light": "light", "auto": "auto"}.get(getattr(args, "theme", "dark"), "abyssal")
+    first = G_SDC + SDC_MODEL_LABEL
+
+    try:
+        _prop = torch.cuda.get_device_properties(0)
+        _cap = torch.cuda.get_device_capability(0)
+        gpu_label = f"{_prop.name} | {_prop.total_memory / GIB:.0f} GB | SM {_cap[0]}.{_cap[1]}"
+        if _cap < (8, 0):
+            print("GTX 1660/Turing detected: sdcpp GGUF backend selected for RealVisXL; CUDA auto backend + CPU parameter residency.")
+    except Exception:
+        gpu_label = "no GPU detected"
+
+    bs_link = ('<link rel="stylesheet" href="/static/bootstrap.min.css">' if have_bootstrap else
+               f'<link rel="stylesheet" href="{BOOTSTRAP_URL}">')
+    page = (INDEX_HTML.replace("__BSLINK__", bs_link).replace("__GPU__", htmlmod.escape(gpu_label))
+            .replace("__DEFAULT_THEME__", default_theme)).encode("utf-8")
+
+    def history_items(limit=60):
+        out = []
+        files = sorted(OUTPUT_DIR.glob("*.png"), key=lambda f: f.stat().st_mtime, reverse=True)[:limit]
+        for f in files:
+            prompt, seed = "", ""
+            try:
+                with Image.open(f) as im:
+                    prompt, seed = im.text.get("prompt", ""), im.text.get("seed", "")
+            except Exception:
+                pass
+            out.append(dict(url=f"/outputs/{f.name}", name=f.name, prompt=prompt, seed=seed))
+        return out
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "ImageGenLocal"
+
+        def log_message(self, *a):
+            pass
+
+        def _host_ok(self):
+            host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+            return host in ("127.0.0.1", "localhost", "::1")
+
+        def _send(self, code, body, ctype, extra=None):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _json(self, obj, code=200):
+            self._send(code, json.dumps(obj).encode("utf-8"), "application/json; charset=utf-8")
+
+        def _file(self, path: Path, ctype):
+            if not path.is_file():
+                return self._send(404, b"not found", "text/plain")
+            data = path.read_bytes()
+            self._send(200, data, ctype, {"Cache-Control": "max-age=3600"})
+
+        def do_GET(self):
+            if not self._host_ok():
+                return self._send(403, b"forbidden", "text/plain")
+            u = urlparse(self.path)
+            route = u.path
+            if route == "/":
+                return self._send(200, page, "text/html; charset=utf-8")
+            if route == "/static/bootstrap.min.css":
+                return self._file(STATIC_DIR / "bootstrap.min.css", "text/css; charset=utf-8")
+            if route.startswith("/outputs/"):
+                return self._file(OUTPUT_DIR / Path(route[len("/outputs/"):]).name, "image/png")
+            if route == "/api/config":
+                return self._json(dict(
+                    models=model_list(), default_model=first, themes=THEMES, quants=["Auto"] + QUANTS,
+                    samplers=list(SAMPLERS), default_negative=DEFAULT_NEG, has_token=bool(hf_token),
+                    families=[dict(label="Auto (guess from file name)", value="auto")] +
+                             [dict(label=f["label"], value=k) for k, f in FAMILIES.items()]))
+            if route == "/api/models":
+                return self._json(dict(models=model_list()))
+            if route == "/api/modelinfo":
+                m = (parse_qs(u.query).get("model") or [""])[0]
+                try:
+                    s = get_spec(m)
+                except UserError as e:
+                    return self._json(dict(error=str(e)))
+                except Exception as e:
+                    return self._json(dict(error=str(e)))
+                return self._json(dict(info=re.sub(r"\*\*", "", s["info"]), steps=s["steps"], cfg=s["cfg"],
+                                       size=s["size"], gguf=s["gguf"], local_gguf=s["local_gguf"]))
+            if route == "/api/status":
+                with job_lock:
+                    return self._json(dict(job))
+            if route == "/api/logs":
+                with log_lock:
+                    captured = "".join(log_chunks)
+                return self._json(dict(logs=captured))
+            if route == "/api/history":
+                return self._json(dict(items=history_items()))
+            return self._send(404, b"not found", "text/plain")
+
+        def do_POST(self):
+            if not self._host_ok():
+                return self._send(403, b"forbidden", "text/plain")
+            if "application/json" not in (self.headers.get("Content-Type") or ""):
+                return self._send(415, b"json only", "text/plain")
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(min(n, 1_000_000)) or b"{}")
+            except Exception:
+                return self._json(dict(error="Bad request."), 400)
+            route = urlparse(self.path).path
+            if route == "/api/generate":
+                with job_lock:
+                    if job["running"]:
+                        return self._json(dict(error="A generation is already running."))
+                    job.update(running=True, progress=0.0, message="Starting ...", images=[], error=None, stop=False)
+                try:
+                    threading.Thread(target=job_thread, args=(body,), daemon=True).start()
+                except Exception as e:
+                    with job_lock:
+                        job["running"] = False
+                    return self._json(dict(error=str(e)))
+                return self._json(dict(ok=True))
+            if route == "/api/stop":
+                job["stop"] = True
+                with sdc_proc_lock:
+                    active = sdc_proc.get("process")
+                    if active is not None and active.poll() is None:
+                        try:
+                            active.terminate()
+                        except Exception:
+                            pass
+                return self._json(dict(message="Stopping generation ..."))
+            if route == "/api/free":
+                if job["running"]:
+                    return self._json(dict(message="Can't free VRAM while generating."))
+                unload()
+                return self._json(dict(message="Model unloaded, VRAM freed."))
+            if route == "/api/open":
+                try:
+                    if os.name == "nt":
+                        os.startfile(str(OUTPUT_DIR))  # type: ignore[attr-defined]
+                    elif sys.platform == "darwin":
+                        subprocess.Popen(["open", str(OUTPUT_DIR)])
+                    else:
+                        subprocess.Popen(["xdg-open", str(OUTPUT_DIR)])
+                    return self._json(dict(message=f"Opened {OUTPUT_DIR}"))
+                except Exception as e:
+                    return self._json(dict(message=f"Couldn't open folder: {e}"))
+            return self._send(404, b"not found", "text/plain")
+
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    server.daemon_threads = True
+    url = f"http://127.0.0.1:{args.port}/"
+    print(f"Image Gen Local running at {url}  (Ctrl+C to quit)")
+    if not args.no_browser:
+        import webbrowser
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nBye.")
+    finally:
+        server.server_close()
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+def main():
+    ap = argparse.ArgumentParser(description="Image Gen Local - local image generation UI")
+    ap.add_argument("--offline", action="store_true", help="never contact the internet")
+    ap.add_argument("--reinstall", action="store_true", help="rebuild the private environment")
+    ap.add_argument("--setup-only", action="store_true", help="install only, don't launch")
+    ap.add_argument("--port", type=int, default=7860)
+    ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--theme", choices=["dark", "light", "auto"], default="dark",
+                    help="default look (auto follows your system); colour themes are in the UI")
+    args = ap.parse_args()
+
+    inside_venv = Path(sys.prefix).resolve() == VENV_DIR.resolve()
+    if not inside_venv:
+        if args.reinstall or not is_setup():
+            setup(force=args.reinstall)
+        if args.setup_only:
+            return
+        print("Launching Image Gen Local...")
+        sys.exit(subprocess.call([str(venv_python()), str(Path(__file__).resolve()), *sys.argv[1:]]))
+    run_app(args)
+
+
+if __name__ == "__main__":
+    main()
