@@ -38,10 +38,6 @@ This project provides a fully functional, local tool to generate high-quality im
 - **Memory management:** Automatic GPU/CPU offloading to accommodate limited VRAM.
 - **Local execution:** Image generation, outputs and model storage remain on your machine.
 
-## ⚙️ Setup Guide
-
-Follow these steps to get the project running locally.
-
 ### Prerequisites
 
 *   Python 3.x
@@ -51,13 +47,13 @@ Follow these steps to get the project running locally.
 
 Execute the main Python script to start the application:
 ```bash
-python generate.py
+python <file-name>.py
 ```
 
 ---
 
 ### ⚙️ This is my own Current Setup
-#### If you have a better setup, it will be faster. Don't recommend rig below this.
+#### If you have a better setup, it will be faster. Don't recommend any rig below this.
 
 | Component | Detail |
 | :--- | :--- |
@@ -65,11 +61,6 @@ python generate.py
 | **VRAM** | **6 GB** |
 | **CPU** | **11th Gen Intel(R) Core(TM) i5-11600 @ 2.80GHz (2.81 GHz)** |
 | **RAM** | **16.0 GB** |
-
-### ⬆️ Hardware Reccomendation
-
-*   **Upgrade Target:** RTX 3060 (12GB VRAM) or higher.
-*   **Benefit:** Enables faster generation and higher resolutions by increasing VRAM capacity.
 
 ## 📸 Showcase
 
