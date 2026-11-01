@@ -49,7 +49,7 @@ python <file-name>.py
 ---
 
 ### ⚙️ This is my own Current Setup
-#### If you have a better setup, it will be faster. Don't recommend any rig below this.
+If you have a better setup, it will be faster. Don't recommend any rig below this.
 
 | Component | Detail |
 | :--- | :--- |
