@@ -7,7 +7,7 @@ A fast, local platform for AI image creation.
 
 ## 💡 Project Overview
 
-This project provides a fully functional, local environment to generate high-quality images using a **[Model Name]** diffusion model. It allows users to generate content instantly without requiring external API calls, offering speed, privacy, and complete control over the generation process.
+This project provides a fully functional, local environment to generate high-quality images using local models setup and used from HuggingFace. It allows users to generate content instantly without requiring external API calls, offering speed, privacy, and complete control over the generation process. 
 
 **Core Goal:** To democratize AI image generation by making powerful models accessible directly on local hardware.
 
@@ -63,14 +63,14 @@ python generate.py
 
 ## 🖥️ Hardware & Performance
 
-### ⚙️ Current Setup
+### ⚙️ My Current Setup
 
 | Component | Detail |
 | :--- | :--- |
 | **GPU** | **NVIDIA GeForce GTX 1660** |
 | **VRAM** | **6 GB** |
-| **CPU** | `[Your CPU Model]` |
-| **OS** | `[Your Operating System]` |
+| **CPU** | **11th Gen Intel(R) Core(TM) i5-11600 @ 2.80GHz (2.81 GHz)** |
+| **RAM** | **16.0 GB** |
 
 ### ⬆️ Upgrade Path
 
@@ -81,19 +81,29 @@ python generate.py
 
 **Visual Examples**
 
-### 🖼️ Generations (5 Examples)
+## Tools
 
-*   **Gen 1:** `[Prompt Description]` | `![Gen 1](screenshots/generated/img1.png)`
-*   **Gen 2:** `[Prompt Description]` | `![Gen 2](screenshots/generated/img2.png)`
-*   **Gen 3:** `[Prompt Description]` | `![Gen 3](screenshots/generated/img3.png)`
-*   **Gen 4:** `[Prompt Description]` | `![Gen 4](screenshots/generated/img4.png)`
-*   **Gen 5:** `[Prompt Description]` | `![Gen 5](screenshots/generated/img5.png)`
+<p align="center">
+  <img src="./screenshots/the_tool/t2.png" />
+</p>
+<p align="center">
+  <img src="./screenshots/the_tool/t1.png" />
+</p>
+<p align="center">
+  <img src="./screenshots/the_tool/t3.png" />
+</p>
 
-### 🛠️ Tools Used (3 Examples)
+## Image Generations
 
-*   **Tool 1:** `[Tool Name]` (For preprocessing) | `![Tool 1](screenshots/the_tool/tool1.png)`
-*   **Tool 2:** `[Tool Name]` (For model loading) | `![Tool 2](screenshots/the_tool/tool2.png)`
-*   **Tool 3:** `[Tool Name]` (For interface display) | `![Tool 3](screenshots/the_tool/tool3.png)`
+<p align="center">
+  <img src="./screenshots/generated/g3.png" width="48%" />
+  <img src="./screenshots/generated/g4.png" width="48%" />
+</p>
+
+<p align="center">
+  <img src="./screenshots/generated/g8.png" width="48%" />
+  <img src="./screenshots/generated/g5.png" width="48%" />
+</p>
 
 ---
 
