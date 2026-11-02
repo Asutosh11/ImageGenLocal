@@ -65,9 +65,6 @@ If you have a better setup, it will be faster. Don't recommend any rig below thi
 <p align="center">
   <img src="./screenshots/the_tool/t3.png" />
 </p>
-<p align="center">
-  <img src="./screenshots/the_tool/t1.png" />
-</p>
 
 ## Output Images
 
