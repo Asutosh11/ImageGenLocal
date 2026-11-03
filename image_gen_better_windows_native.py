@@ -328,7 +328,22 @@ select.form-select option:checked, select.form-select option:hover { background-
 .is-gguf .d-gguf { display: block; }
 .d-localgguf { display: none; }
 .is-localgguf .d-localgguf { display: block; }
+.is-sdcpp #memory, .is-sdcpp label[for="memory"] { display: none !important; }
 .hist-thumb { aspect-ratio: 1 / 1; object-fit: cover; cursor: zoom-in; }
+
+.model-ratings { padding: .65rem .75rem; border: 1px solid var(--bs-border-color); border-radius: .65rem; background: var(--bs-tertiary-bg); }
+.rating-line { display: grid; grid-template-columns: minmax(105px, 1fr) auto minmax(72px, .9fr); align-items: center; gap: .55rem; margin: .2rem 0; }
+.rating-label { font-size: .82rem; color: var(--bs-secondary-color); }
+.rating-value { min-width: 3.8rem; text-align: center; font-size: .78rem; font-weight: 750; padding: .16rem .4rem; border-radius: 999px; }
+.rating-good { color: #146c43; background: #d1e7dd; }
+.rating-mid { color: #805500; background: #fff3cd; }
+.rating-low { color: #842029; background: #f8d7da; }
+.rating-meter { height: .42rem; border-radius: 99px; background: var(--bs-secondary-bg); overflow: hidden; }
+.rating-meter > span { display: block; height: 100%; width: 0; border-radius: inherit; background: #198754; transition: width .2s ease; }
+.rating-meter > span.mid { background: #d39e00; }
+.rating-meter > span.low { background: #dc3545; }
+.rating-note { margin-top: .4rem; font-size: .7rem; color: var(--bs-secondary-color); line-height: 1.35; }
+
 </style>
 </head>
 <body>
@@ -362,10 +377,45 @@ select.form-select option:checked, select.form-select option:hover { background-
           </div>
 
           <div>
+            <label class="form-label" for="style">Art style</label>
+            <select id="style" class="form-select">
+              <option value="none">No style preset</option>
+              <option value="watercolor">Watercolor painting</option>
+              <option value="loose-watercolor">Loose watercolor wash</option>
+              <option value="ink-wash">Japanese ink &amp; watercolor</option>
+              <option value="pencil">Pencil sketch</option>
+              <option value="charcoal">Charcoal drawing</option>
+              <option value="ink">Fine-line ink illustration</option>
+              <option value="gouache">Gouache painting</option>
+              <option value="pastel">Soft pastel painting</option>
+              <option value="dreamy">Dreamy ethereal art</option>
+              <option value="surreal">Surreal dreamscape</option>
+              <option value="storybook">Whimsical storybook illustration</option>
+              <option value="botanical">Vintage botanical illustration</option>
+              <option value="oil">Expressive oil painting</option>
+              <option value="concept">Fantasy concept art</option>
+            </select>
+            <div class="form-text">Style recipes guide the selected checkpoint; they do not download separate model weights. For painterly results, start with DreamShaper XL Turbo.</div>
+          </div>
+
+          <div>
             <label class="form-label" for="model">Model</label>
             <select id="model" class="form-select"></select>
+            <div id="model-ratings" class="model-ratings mt-2" aria-live="polite">
+              <div class="rating-line">
+                <span class="rating-label">Image quality</span>
+                <span id="quality-rating" class="rating-value rating-good">—/10</span>
+                <span id="quality-meter" class="rating-meter"><span></span></span>
+              </div>
+              <div class="rating-line">
+                <span class="rating-label">Generation speed</span>
+                <span id="speed-rating" class="rating-value rating-good">—/10</span>
+                <span id="speed-meter" class="rating-meter"><span></span></span>
+              </div>
+              <div id="rating-note" class="rating-note">Estimated ratings for your GTX 1660 6GB setup; higher speed score means faster generation.</div>
+            </div>
             <div id="info" class="alert alert-info-soft py-2 px-3 mt-2 mb-0"></div>
-            <div class="small-note mt-2">RealVisXL GGUF runs through the native Windows stable-diffusion.cpp CUDA engine. The engine and model are downloaded automatically on first generation. Other legacy models remain available.</div>
+            <div class="small-note mt-2">All listed models are GGUF builds for native Windows stable-diffusion.cpp. CUDA does the compute; model weights can be offloaded to system RAM automatically when VRAM is tight.</div>
           </div>
 
           <div class="d-gguf">
@@ -374,17 +424,8 @@ select.form-select option:checked, select.form-select option:hover { background-
                 <label class="form-label" for="quant">GGUF quantization</label>
                 <select id="quant" class="form-select"></select>
               </div>
-              <div class="col-6">
-                <label class="form-label" for="memory">Memory</label>
-                <select id="memory" class="form-select">
-                  <option value="auto">Auto</option>
-                  <option value="gpu">All on GPU</option>
-                  <option value="balanced">Balanced offload</option>
-                  <option value="partial">Partial offload</option>
-                </select>
-              </div>
             </div>
-            <div class="form-text">Auto keeps as much on the GPU as fits and offloads only the rest to CPU.</div>
+            <div class="form-text">Auto selects Q4_K_S for 6 GB GPUs. Q8_0 is available for better fidelity and uses RAM offload as required.</div>
           </div>
 
           <div class="row g-2 align-items-end">
@@ -531,9 +572,25 @@ function applyInfo(m, keepSize) {
   const root = document.documentElement;
   document.body.classList.toggle("is-gguf", !!m.gguf);
   document.body.classList.toggle("is-localgguf", !!m.local_gguf);
+  document.body.classList.toggle("is-sdcpp", m.kind === "sdcpp");
   setRange("steps", m.steps); setRange("cfg", m.cfg);
   const [w, h] = dims(m.size, shape());
   setRange("width", w); setRange("height", h);
+  const paintRating = (id, meterId, value) => {
+    const score = Number(value);
+    const valid = Number.isFinite(score);
+    const safe = valid ? Math.max(0, Math.min(10, score)) : 0;
+    const level = safe >= 8 ? "good" : (safe >= 6 ? "mid" : "low");
+    const badge = $(id), fill = $(meterId).firstElementChild;
+    badge.textContent = valid ? safe.toFixed(1) + "/10" : "N/A";
+    badge.className = "rating-value rating-" + level;
+    fill.style.width = safe * 10 + "%";
+    fill.className = level === "good" ? "" : level;
+  };
+  paintRating("quality-rating", "quality-meter", m.quality_rating);
+  paintRating("speed-rating", "speed-meter", m.speed_rating);
+  $("rating-note").textContent = m.rating_note ||
+    "Estimated for GTX 1660 6GB at 768×768, Q4_K_S, one image. Higher generation-speed score means faster; actual time varies with CPU, RAM and offloading.";
   curModel = m;
 }
 async function onModel() {
@@ -591,7 +648,7 @@ function startPolling() { if (!timer) timer = setInterval(poll, 500); poll(); }
 async function generate() {
   const p = {
     prompt: $("prompt").value, negative: $("negative").value, model: $("model").value,
-    family: $("family").value, quant: $("quant").value, memory: $("memory").value,
+    style: $("style").value, family: $("family").value, quant: $("quant").value,
     force_sdxl: $("force-sdxl").checked, sampler: $("sampler").value,
     steps: +$("steps").value, cfg: +$("cfg").value, width: +$("width").value, height: +$("height").value,
     count: +$("count").value, seed: $("seed").value === "" ? -1 : +$("seed").value,
@@ -807,11 +864,66 @@ def run_app(args):
     }
     G_CAT, G_FILE, G_CLS, G_LOC = "[GGUF] ", "[GGUF file] ", "[Classic] ", "[local] "
     G_SDC = "[sd.cpp] "
-    SDC_MODEL_LABEL = "RealVisXL v5.0 Lightning GGUF (Q4_K_S) | stable-diffusion.cpp"
-    SDC_MODEL = dict(
-        kind="sdcpp", repo="off-grid-ai/realvisxl-v5.0-lightning-GGUF",
-        filename="realvisxl-v5.0-lightning-Q4_K_S.gguf", steps=6, cfg=1.5, size=768,
-        info="RealVisXL Lightning quantised GGUF, executed by stable-diffusion.cpp. First generation downloads the Windows engine and ~2.8 GB model. Recommended for GTX 1660 6GB: 768px, 6 steps, CFG 1.5, Euler, CUDA compute with CPU parameter residency.")
+    # GGUF files below are verified stable-diffusion.cpp conversions from Hugging Face.
+    # Q4_K_S is the default for a 6 GB GPU; Q8_0 is available for higher fidelity
+    # and is RAM-offloaded by the native engine when it does not fit in VRAM.
+    SDC_MODELS = {
+        "01 | RealVisXL v5 Lightning | Fast photorealism": dict(quality_rating=8.2, speed_rating=9.5, rating_note="Estimated for GTX 1660 6GB at 768×768, Q4_K_S, one image; not a measured benchmark. Higher speed score means faster.",
+            repo="off-grid-ai/realvisxl-v5.0-lightning-GGUF",
+            files={"Q4_K_S": "realvisxl-v5.0-lightning-Q4_K_S.gguf", "Q8_0": "realvisxl-v5.0-lightning-Q8_0.gguf"},
+            steps=6, cfg=1.5, size=768, sampler="euler",
+            info="Fast photorealistic SDXL Lightning. Recommended starting model: 6 steps, CFG 1.5, Euler. Q4_K_S is the 6 GB-friendly default; Q8_0 uses more RAM for higher fidelity."),
+        "02 | DreamShaper XL v2 Turbo | Fast creative": dict(quality_rating=8.6, speed_rating=9.3, rating_note="Estimated for GTX 1660 6GB at 768×768, Q4_K_S, one image; not a measured benchmark. Higher speed score means faster.",
+            repo="off-grid-ai/dreamshaper-xl-v2-turbo-GGUF",
+            files={"Q4_K_S": "dreamshaper-xl-v2-turbo-Q4_K_S.gguf", "Q8_0": "dreamshaper-xl-v2-turbo-Q8_0.gguf"},
+            steps=6, cfg=1.5, size=768, sampler="euler",
+            info="Fast SDXL Turbo model for creative, painterly, illustrative and semi-realistic images. A good first choice for watercolor, gouache, sketch and dreamy style recipes. Model-card settings: 6 steps, CFG 1.5, Euler."),
+        "03 | RealVisXL v5 | Higher-quality photorealism": dict(quality_rating=9.1, speed_rating=6.0, rating_note="Estimated for GTX 1660 6GB at 768×768, Q4_K_S, one image; not a measured benchmark. Higher speed score means faster.",
+            repo="off-grid-ai/realvisxl-v5.0-GGUF",
+            files={"Q4_K_S": "realvisxl-v5.0-Q4_K_S.gguf", "Q8_0": "realvisxl-v5.0-Q8_0.gguf"},
+            steps=24, cfg=5.0, size=768, sampler="dpm++2m",
+            info="Higher-quality photorealistic SDXL. Slower than Lightning; model card recommends 24 steps, CFG 5 and DPM++ 2M."),
+        "04 | Juggernaut XL v9 | Versatile realism": dict(quality_rating=9.2, speed_rating=6.0, rating_note="Estimated for GTX 1660 6GB at 768×768, Q4_K_S, one image; not a measured benchmark. Higher speed score means faster.",
+            repo="off-grid-ai/juggernaut-xl-v9-GGUF",
+            files={"Q4_K_S": "juggernaut-xl-v9-Q4_K_S.gguf", "Q8_0": "juggernaut-xl-v9-Q8_0.gguf"},
+            steps=24, cfg=5.0, size=768, sampler="dpm++2m",
+            info="Versatile SDXL checkpoint for cinematic, photographic and general-purpose images. Slower high-detail profile: 24 steps, CFG 5, DPM++ 2M."),
+        "05 | Illustrious XL v2 | Anime / illustration": dict(quality_rating=9.2, speed_rating=5.8, rating_note="Estimated for GTX 1660 6GB at 768×768, Q4_K_S, one image; not a measured benchmark. Higher speed score means faster.",
+            repo="off-grid-ai/illustrious-xl-v2.0-GGUF",
+            files={"Q4_K_S": "illustrious-xl-v2.0-Q4_K_S.gguf", "Q8_0": "illustrious-xl-v2.0-Q8_0.gguf"},
+            steps=24, cfg=5.0, size=768, sampler="dpm++2m",
+            info="Stylised illustration-focused SDXL model. Useful for graphic, decorative and highly designed art; pair with the watercolor, ink or storybook style recipes. Recommended model-card profile: 24 steps, CFG 5, DPM++ 2M."),
+        "06 | Animagine XL 4.0 | Anime / character art": dict(quality_rating=9.1, speed_rating=5.8, rating_note="Estimated for GTX 1660 6GB at 768×768, Q4_K_S, one image; not a measured benchmark. Higher speed score means faster.",
+            repo="off-grid-ai/animagine-xl-4.0-GGUF",
+            files={"Q4_K_S": "animagine-xl-4.0-Q4_K_S.gguf", "Q8_0": "animagine-xl-4.0-Q8_0.gguf"},
+            steps=24, cfg=5.0, size=768, sampler="dpm++2m",
+            info="Anime and character illustration model. Recommended model-card profile: 24 steps, CFG 5, DPM++ 2M."),
+        "07 | Pony Diffusion V6 XL | Stylised characters": dict(quality_rating=8.9, speed_rating=5.8, rating_note="Estimated for GTX 1660 6GB at 768×768, Q4_K_S, one image; not a measured benchmark. Higher speed score means faster.",
+            repo="off-grid-ai/pony-diffusion-v6-xl-GGUF",
+            files={"Q4_K_S": "pony-diffusion-v6-xl-Q4_K_S.gguf", "Q8_0": "pony-diffusion-v6-xl-Q8_0.gguf"},
+            steps=24, cfg=5.0, size=768, sampler="dpm++2m",
+            info="Specialised stylised-character and anime model. Recommended model-card profile: 24 steps, CFG 5, DPM++ 2M."),
+    }
+    # Prompt-level art recipes. These do not pretend to be separate checkpoints;
+    # they steer any selected SDXL model, with DreamShaper XL Turbo recommended.
+    ART_STYLES = {
+        "none": "",
+        "watercolor": "traditional watercolor painting, translucent watercolor pigments, delicate layered washes, soft wet-on-wet edges, subtle cold-pressed paper texture, luminous color blooms",
+        "loose-watercolor": "loose expressive watercolor painting, spontaneous brushwork, flowing pigment, visible paper white, soft color bleeds, atmospheric washes, impressionistic composition",
+        "ink-wash": "sumi-e inspired ink and watercolor painting, expressive brush lines, restrained palette, fluid ink contours, delicate transparent color washes, handmade washi paper texture",
+        "pencil": "beautiful graphite pencil sketch, hand-drawn construction lines, varied pencil pressure, fine hatching and cross-hatching, subtle paper grain, monochrome study",
+        "charcoal": "expressive charcoal drawing, rich charcoal blacks, soft smudged shading, visible charcoal strokes, tonal study on textured drawing paper",
+        "ink": "fine-line pen and ink illustration, confident contour lines, delicate cross-hatching, detailed hand-drawn linework, archival ink on warm paper",
+        "gouache": "gouache painting, opaque matte pigments, bold simplified shapes, layered brush strokes, rich yet harmonious colors, textured painted surface",
+        "pastel": "soft pastel painting, powdery pastel pigments, gentle blended edges, muted harmonious palette, visible pastel strokes on textured paper",
+        "dreamy": "dreamlike ethereal fine art, hazy luminous atmosphere, soft glowing light, delicate color gradients, poetic visual mood, subtle surreal details, painterly finish",
+        "surreal": "surrealist dreamscape painting, imaginative impossible architecture, symbolic visual metaphors, floating forms, atmospheric perspective, mysterious poetic mood",
+        "storybook": "whimsical hand-painted storybook illustration, charming shapes, expressive characters, warm gentle palette, delicate texture, magical narrative atmosphere",
+        "botanical": "vintage botanical watercolor plate, scientifically observed plant forms, fine ink details, transparent watercolor, naturalist illustration, aged ivory paper",
+        "oil": "expressive oil painting, visible impasto brush strokes, rich pigment, painterly color mixing, artful canvas texture, confident composition",
+        "concept": "high-end fantasy concept art, imaginative worldbuilding, cinematic composition, atmospheric depth, painterly details, evocative lighting"
+    }
+    SDC_DEFAULT_LABEL = next(iter(SDC_MODELS))
     # best quality first; Auto walks this list
     QUANTS = ["Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q4_K_M", "Q4_K_S", "Q4_0", "Q3_K_M", "Q3_K_S", "Q2_K"]
     QUANT_FALLBACK = ["Q4_K_M", "Q4_K_S", "Q4_0", "Q3_K_M", "Q3_K_S", "Q2_K", "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0"]
@@ -842,12 +954,12 @@ def run_app(args):
         return sorted(p for p in MODELS_DIR.glob("*.gguf") if p.is_file())
 
     def model_list():
-        out = [dict(group="GGUF via stable-diffusion.cpp (recommended)", label=SDC_MODEL_LABEL, value=G_SDC + SDC_MODEL_LABEL)]
-        out += [dict(group="OpenRAIL models (Diffusers GGUF)", label=n, value=G_CAT + n) for n in GGUF_CATALOG]
-        out += [dict(group="Classic safetensors (not GGUF)", label=n, value=G_CLS + n) for n in CLASSIC]
-        out += [dict(group="Local checkpoints (.safetensors)", label=p.name, value=G_LOC + p.name)
-                for p in sorted(MODELS_DIR.glob("*.safetensors"))]
-        return out
+        # This build intentionally exposes GGUF image models only.
+        return [dict(
+                    group="GGUF models | native stable-diffusion.cpp",
+                    label=f"{n}  |  Q {spec['quality_rating']:.1f}  ·  Speed {spec['speed_rating']:.1f}",
+                    value=G_SDC + n)
+                for n, spec in SDC_MODELS.items()]
 
     def guess_family(path: Path):
         n = path.name.lower()
@@ -878,7 +990,12 @@ def run_app(args):
 
     def get_spec(choice, force_sdxl=False, family="auto"):
         if choice.startswith(G_SDC):
-            return dict(SDC_MODEL, gguf=False, local_gguf=False, gated=False, info=SDC_MODEL["info"])
+            name = choice[len(G_SDC):]
+            if name not in SDC_MODELS:
+                raise UserError("Unknown GGUF model. Press Refresh models.")
+            spec = dict(SDC_MODELS[name])
+            spec.update(kind="sdcpp", label=name, gguf=True, local_gguf=False, gated=False)
+            return spec
         if choice.startswith(G_CAT):
             name = choice[len(G_CAT):]
             if name not in GGUF_CATALOG:
@@ -1051,8 +1168,6 @@ def run_app(args):
     # ----- native Windows stable-diffusion.cpp backend ----------------------- #
     # The Python UI stays in the existing venv. The inference engine is a native
     # Windows CUDA executable; Docker/WSL2/Git/CMake are deliberately not used.
-    SDC_REPO = "off-grid-ai/realvisxl-v5.0-lightning-GGUF"
-    SDC_FILENAME = "realvisxl-v5.0-lightning-Q4_K_S.gguf"
     SDC_RELEASE_API = "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest"
     SDC_BIN_DIR = SDCPP_DIR / "bin"
     SDC_EXE = SDC_BIN_DIR / "sd-cli.exe"
@@ -1088,7 +1203,20 @@ def run_app(args):
         if os.name != "nt":
             raise UserError("This backend installer is configured for native Windows. Run the app on Windows.")
         if SDC_EXE.exists() and (SDC_BIN_DIR / "stable-diffusion.dll").exists():
-            return str(SDC_EXE)
+            # Reuse the installed engine only if it supports the RAM auto-fit flags
+            # used by this build. Otherwise fetch a current official Windows binary.
+            try:
+                probe = subprocess.run([str(SDC_EXE), "--help"], cwd=str(SDC_BIN_DIR),
+                                       capture_output=True, text=True, timeout=30,
+                                       encoding="utf-8", errors="replace",
+                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                help_text = (probe.stdout or "") + (probe.stderr or "")
+                if "--offload-to-cpu" in help_text and "--auto-fit" in help_text:
+                    return str(SDC_EXE)
+                print("Installed stable-diffusion.cpp is older than the RAM auto-fit interface; updating it...", flush=True)
+            except Exception as e:
+                print(f"Could not validate installed stable-diffusion.cpp ({e}); updating it...", flush=True)
+            SDC_EXE.unlink(missing_ok=True)
         if args.offline:
             raise UserError(f"Offline mode: native sd.cpp is not installed. Expected executable: {SDC_EXE}")
         import json
@@ -1178,40 +1306,53 @@ def run_app(args):
         print(f"Release: {release.get('tag_name', 'latest')} | CUDA 12 Windows x64", flush=True)
         return str(SDC_EXE)
 
-    def ensure_sdc_model(token=None):
-        target = MODELS_DIR / SDC_FILENAME
+    def ensure_sdc_model(spec, quant="Q4_K_S", token=None):
+        files = spec["files"]
+        # Auto is deliberately conservative on a 6 GB card; Q8 is an explicit quality choice.
+        quant = "Q4_K_S" if quant in (None, "", "Auto") else quant
+        if quant not in files:
+            raise UserError(f"{spec['label']} has no {quant} quant. Available: {', '.join(files)}")
+        filename = files[quant]
+        repo = spec["repo"]
+        repo_dir = MODELS_DIR / "sd_cpp_models" / repo.replace("/", "__")
+        target = repo_dir / filename
         if target.exists() and target.stat().st_size > 1_000_000_000:
-            return target
+            return target, quant
         if args.offline:
-            raise UserError(f"Offline mode: the RealVisXL GGUF is not downloaded. Download {SDC_FILENAME} from https://huggingface.co/{SDC_REPO}/blob/main/{SDC_FILENAME} into {MODELS_DIR}.")
-        setmsg(0.23, "Downloading RealVisXL Lightning GGUF (~2.8 GB, first run only) ...")
+            raise UserError(f"Offline mode: {filename} is not downloaded. Download it from https://huggingface.co/{repo}/blob/main/{filename} into {repo_dir}.")
+        setmsg(0.23, f"Downloading {spec['label']} {quant} GGUF (first run only) ...")
         try:
             from huggingface_hub import hf_hub_download
-            downloaded = hf_hub_download(repo_id=SDC_REPO, filename=SDC_FILENAME,
-                                         local_dir=str(MODELS_DIR), token=token or None)
+            downloaded = hf_hub_download(repo_id=repo, filename=filename,
+                                         local_dir=str(repo_dir), token=token or None)
             result = Path(downloaded)
             if not result.exists() or result.stat().st_size < 1_000_000_000:
                 raise RuntimeError("downloaded GGUF file is unexpectedly small")
-            print(f"RealVisXL GGUF ready: {result} ({result.stat().st_size / 1024**3:.2f} GiB)")
-            return result
+            print(f"GGUF ready: {result} ({result.stat().st_size / 1024**3:.2f} GiB)")
+            return result, quant
         except Exception as e:
-            raise UserError(f"Could not download RealVisXL GGUF from Hugging Face: {e}")
+            raise UserError(f"Could not download {filename} from Hugging Face ({repo}): {e}")
 
     def run_sdcpp_image(p, spec, seed, output_path, index, count):
         exe = ensure_sd_cpp()
-        model = ensure_sdc_model((p.get("token") or "").strip() or hf_token or None)
+        model, quant = ensure_sdc_model(spec, p.get("quant", "Auto"),
+                                        (p.get("token") or "").strip() or hf_token or None)
         width, height = int(p["width"]), int(p["height"])
         width = max(512, min(1024, round(width / 64) * 64))
         height = max(512, min(1024, round(height / 64) * 64))
-        steps = max(1, min(20, int(p.get("steps", 6))))
-        cfg = max(0.5, min(5.0, float(p.get("cfg", 1.5))))
+        steps = max(1, min(40, int(p.get("steps", spec["steps"]))))
+        cfg = max(0.0, min(10.0, float(p.get("cfg", spec["cfg"]))))
         prompt = (p.get("prompt") or "").strip()
         negative = (p.get("negative") or "").strip()
         command = [exe, "-M", "img_gen", "-m", str(model), "-p", prompt,
                    "-o", str(output_path), "-W", str(width), "-H", str(height),
                    "--steps", str(steps), "--cfg-scale", str(cfg),
-                   "--sampling-method", "euler", "--seed", str(seed),
-                   "--backend", "cuda", "--params-backend", "cpu"]
+                   "--sampling-method", spec.get("sampler", "euler"), "--seed", str(seed),
+                   # Keep compute on CUDA, but allow sd.cpp to place weights in system RAM
+                   # and stream them as required. Auto-fit reserves VRAM for activations.
+                   "--backend", "cuda0", "--offload-to-cpu", "--auto-fit", "on",
+                   "--max-vram", str(max(2.0, min(4.5, torch.cuda.get_device_properties(0).total_memory / GIB - 1.2))),
+                   "--mmap"]
         if negative:
             command += ["-n", negative]
         print("Launching native Windows sd.cpp:", subprocess.list2cmdline(command), flush=True)
@@ -1261,33 +1402,40 @@ def run_app(args):
         prompt = (p.get("prompt") or "").strip()
         if not prompt:
             raise UserError("Type a prompt first.")
+        style_key = str(p.get("style", "none"))
+        style_recipe = ART_STYLES.get(style_key, "")
+        effective_prompt = f"{prompt}, {style_recipe}" if style_recipe else prompt
+        generation_p = dict(p)
+        generation_p["prompt"] = effective_prompt
         count = max(1, min(8, int(p.get("count", 1))))
         seed_in = int(p.get("seed", -1))
         base_seed = seed_in if seed_in >= 0 else random.randint(0, 2**31 - 1)
-        steps = max(1, min(20, int(p.get("steps", spec["steps"]))))
+        steps = max(1, min(40, int(p.get("steps", spec["steps"]))))
         cfg = float(p.get("cfg", spec["cfg"]))
         started = time.time()
-        print(f"Using native stable-diffusion.cpp CUDA | RealVisXL Lightning GGUF | {p.get('width')}x{p.get('height')} | {steps} steps | CFG {cfg}", flush=True)
+        selected_quant = p.get("quant", "Auto")
+        selected_quant = "Q4_K_S" if selected_quant in (None, "", "Auto") else selected_quant
+        print(f"Using native stable-diffusion.cpp CUDA | {spec['label']} | {p.get('width')}x{p.get('height')} | {steps} steps | CFG {cfg} | quant {selected_quant}", flush=True)
         for i in range(count):
             if job["stop"]:
                 break
             seed = (base_seed + i) % (2**31 - 1)
             name = f"{time.strftime('%Y%m%d_%H%M%S')}_{seed}.png"
             output_path = OUTPUT_DIR / name
-            img = run_sdcpp_image(p, spec, seed, output_path, i, count)
+            img = run_sdcpp_image(generation_p, spec, seed, output_path, i, count)
             if img is None or job["stop"]:
                 break
             meta = PngInfo()
-            for key, value in (("prompt", prompt), ("negative_prompt", p.get("negative", "")),
-                               ("seed", seed), ("model", SDC_MODEL_LABEL), ("backend", "stable-diffusion.cpp"),
+            for key, value in (("prompt", prompt), ("style_preset", style_key), ("effective_prompt", effective_prompt),
+                               ("negative_prompt", p.get("negative", "")), ("seed", seed), ("model", spec["label"]), ("backend", "stable-diffusion.cpp"),
                                ("steps", steps), ("cfg", cfg), ("resolution", f"{p['width']}x{p['height']}"),
-                               ("quantization", "Q4_K"), ("compute_backend", "CUDA (native Windows)"), ("parameter_backend", "CPU")):
+                               ("quantization", selected_quant), ("compute_backend", "CUDA (native Windows)"), ("parameter_backend", "RAM offload / auto-fit")):
                 meta.add_text(key, str(value))
             # Rewrite with app metadata while retaining the decoded pixels.
             img.save(output_path, format="PNG", pnginfo=meta)
             with job_lock:
                 job["images"].append(dict(url=f"/outputs/{name}", name=name, seed=seed))
-        msg = f"{'Stopped. ' if job['stop'] else 'Done. '}{len(job['images'])} image(s) in {time.time()-started:.0f}s | native stable-diffusion.cpp CUDA backend"
+        msg = f"{'Stopped. ' if job['stop'] else 'Done. '}{len(job['images'])} image(s) in {time.time()-started:.0f}s | {spec['label']} | native CUDA + RAM auto-offload"
         setmsg(1.0 if not job["stop"] else None, msg)
 
     # ----- pipeline management ---------------------------------------------- #
@@ -1760,14 +1908,14 @@ def run_app(args):
     THEMES = {"Abyssal Storm": "abyssal", "Forest Moss": "forest", "Cocoa Zen": "cocoa",
               "Complete Dark": "dark", "Light Parchment": "light"}
     default_theme = {"dark": "abyssal", "light": "light", "auto": "auto"}.get(getattr(args, "theme", "dark"), "abyssal")
-    first = G_SDC + SDC_MODEL_LABEL
+    first = G_SDC + SDC_DEFAULT_LABEL
 
     try:
         _prop = torch.cuda.get_device_properties(0)
         _cap = torch.cuda.get_device_capability(0)
         gpu_label = f"{_prop.name} | {_prop.total_memory / GIB:.0f} GB | SM {_cap[0]}.{_cap[1]}"
         if _cap < (8, 0):
-            print("GTX 1660/Turing detected: sdcpp GGUF backend selected for RealVisXL; CUDA auto backend + CPU parameter residency.")
+            print("Turing/GTX 1660 detected: native stable-diffusion.cpp GGUF backend; CUDA compute with RAM auto-fit enabled.")
     except Exception:
         gpu_label = "no GPU detected"
 
@@ -1832,7 +1980,7 @@ def run_app(args):
                 return self._file(OUTPUT_DIR / Path(route[len("/outputs/"):]).name, "image/png")
             if route == "/api/config":
                 return self._json(dict(
-                    models=model_list(), default_model=first, themes=THEMES, quants=["Auto"] + QUANTS,
+                    models=model_list(), default_model=first, themes=THEMES, quants=["Auto", "Q8_0", "Q4_K_S"],
                     samplers=list(SAMPLERS), default_negative=DEFAULT_NEG, has_token=bool(hf_token),
                     families=[dict(label="Auto (guess from file name)", value="auto")] +
                              [dict(label=f["label"], value=k) for k, f in FAMILIES.items()]))
@@ -1847,7 +1995,9 @@ def run_app(args):
                 except Exception as e:
                     return self._json(dict(error=str(e)))
                 return self._json(dict(info=re.sub(r"\*\*", "", s["info"]), steps=s["steps"], cfg=s["cfg"],
-                                       size=s["size"], gguf=s["gguf"], local_gguf=s["local_gguf"]))
+                                       size=s["size"], gguf=s["gguf"], local_gguf=s["local_gguf"], kind=s["kind"],
+                                       quality_rating=s.get("quality_rating"), speed_rating=s.get("speed_rating"),
+                                       rating_note=s.get("rating_note")))
             if route == "/api/status":
                 with job_lock:
                     return self._json(dict(job))
