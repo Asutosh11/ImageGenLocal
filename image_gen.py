@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Image Gen Local - one-file, fully local image generation UI (Bootstrap front end).
+Image Gen Local · Story Mode - one-file, fully local image generation UI (Bootstrap front end).
 
 SDXL GGUF models run through the native Windows stable-diffusion.cpp CUDA executable.
 The Python web app runs in its private Windows virtual environment. On first use the
@@ -44,7 +44,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-SETUP_VERSION = "7"  # Native Windows stable-diffusion.cpp CUDA backend
+
+SETUP_VERSION = "9"  # spaCy-based story-to-visual-prompt simplification
 ROOT = Path(__file__).resolve().parent / "localgen_data"
 SDCPP_DIR = ROOT / "sd_cpp"
 VENV_DIR = ROOT / "venv"
@@ -62,7 +63,7 @@ TORCH_INDEXES = [
 SUPPORTED_PY = [(3, 12), (3, 11), (3, 10)]  # PyTorch wheels exist for these
 PACKAGES = [
     "diffusers", "transformers", "accelerate", "safetensors", "pillow",
-    "huggingface_hub", "gguf", "sentencepiece", "protobuf",
+    "huggingface_hub", "gguf", "sentencepiece", "protobuf", "spacy",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -116,6 +117,218 @@ def ensure_bootstrap(offline: bool = False) -> bool:
     except Exception as e:
         print(f"  (couldn't download Bootstrap CSS: {e}; the page will fall back to the CDN link)")
         return False
+
+
+
+
+def _load_spacy_pipeline():
+    """Load spaCy's English parser when installed; return None for the offline fallback."""
+    try:
+        import spacy
+        try:
+            return spacy.load("en_core_web_sm")
+        except OSError:
+            return None
+    except Exception:
+        return None
+
+
+def parse_story_scenes(story: str) -> list[str]:
+    """Split explicit scene headings, otherwise split into sentence-sized story beats."""
+    text = (story or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return []
+    heading = re.compile(r"(?im)^\s*(?:scene\s*#?\s*\d+\s*[:.\-]?\s*|scene\s+[ivxlcdm]+\s*[:.\-]?\s*)$")
+    heading_inline = re.compile(r"(?im)^\s*scene\s*(?:#?\d+|[ivxlcdm]+)\s*[:.\-]\s*(.*)$")
+    lines = text.splitlines()
+    headed, current = [], []
+    found_heading = False
+    for line in lines:
+        if heading.match(line.strip()):
+            found_heading = True
+            if "\n".join(current).strip():
+                headed.append("\n".join(current).strip())
+            current = []
+            continue
+        match = heading_inline.match(line)
+        if match:
+            found_heading = True
+            if "\n".join(current).strip():
+                headed.append("\n".join(current).strip())
+            current = [match.group(1).strip()] if match.group(1).strip() else []
+            continue
+        current.append(line)
+    if "\n".join(current).strip():
+        headed.append("\n".join(current).strip())
+    if found_heading:
+        return headed[:40]
+
+    # For unheaded stories, each sentence is a potential visual beat. This is
+    # important when one paragraph contains several distinct events.
+    nlp = _load_spacy_pipeline()
+    if nlp:
+        doc = nlp(text)
+        sentences = [s.text.strip() for s in doc.sents if s.text.strip()]
+    else:
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    return sentences[:40]
+
+
+def _clean_visual_phrase(value: str) -> str:
+    value = re.sub(r"\s+", " ", value or "").strip(" ,.;:-")
+    value = re.sub(r"^(?:the|a|an)\s+", "", value, flags=re.I)
+    return value
+
+
+def simplify_scene_for_image(scene: str, nlp=None) -> str:
+    """Turn narrative prose into a short, concrete image prompt.
+
+    spaCy supplies sentence/dependency/entity analysis when its English model is
+    available. A deterministic visual-language fallback keeps the feature usable
+    offline and avoids requiring a cloud LLM.
+    """
+    raw = re.sub(r"\s+", " ", (scene or "")).strip()
+    if not raw:
+        return ""
+    if raw.startswith(('"', "'", "“", "‘")):
+        return ""
+
+    # Dialogue is usually not drawable. Keep the surrounding visual narration.
+    raw = re.sub(r'["“”][^"“”]*["“”]', " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip(" ,.;:-")
+    if not raw:
+        return ""
+
+    low = raw.lower()
+
+    # Discard dialogue-only and abstract personification. These lines do not
+    # provide a stable visual subject/action for an image model.
+    if scene.strip().startswith(('"', "'", "“", "‘")):
+        return ""
+    if re.search(r"\b(universe|darkness|void)\b", low) and re.search(
+        r"wrap(?:ped|s)? around|blanket|reply|replied|wait(?:ing)?|keep you company|slept|sleeping", low
+    ):
+        return ""
+    if re.search(r"\blight went out\b", low) or re.search(r"\buniverse (?:finally )?slept\b", low):
+        return ""
+
+    # Concrete visual transformations for common story events. These rules also
+    # prevent metaphorical prose from becoming literal, confusing SDXL prompts.
+    if re.search(r"\bstar\b", low) and re.search(r"flicker|shine|glow|light|twinkl|dark|universe", low):
+        return "One tiny bright star shining alone in a vast, dark universe."
+    if re.search(r"\bearth\b", low) and re.search(r"born|form|appear|emerge|creat", low):
+        return "A new planet Earth appearing in space."
+    if re.search(r"\b(tree|trees|forest|woodland)\b", low) and re.search(r"earth|grow|populate|cover|fill|spread", low):
+        return "Green trees growing across the surface of planet Earth."
+    if re.search(r"\b(sun|sunrise|sunset)\b", low):
+        return "The bright sun in the sky, illuminating the surrounding landscape."
+    if re.search(r"\b(moon)\b", low):
+        return "The moon glowing in the night sky."
+    if re.search(r"\b(baby|newborn|child)\b", low) and re.search(r"born|sleep|lie|cradl", low):
+        return "A newborn baby resting peacefully."
+    if re.search(r"\b(city|village|town)\b", low) and re.search(r"appear|build|rise|grow|emerge", low):
+        return "A town with buildings and streets viewed as a clear wide scene."
+
+    # spaCy dependency-based extraction: subject + visible action + object/location.
+    if nlp:
+        try:
+            doc = nlp(raw)
+            sent = next(iter(doc.sents), doc)
+            root = next((t for t in sent if t.dep_ == "ROOT"), None)
+            if root is not None:
+                subjects = [t for t in root.children if t.dep_ in ("nsubj", "nsubjpass", "csubj")]
+                objects = [t for t in root.children if t.dep_ in ("dobj", "obj", "attr", "oprd")]
+                subject = ""
+                if subjects:
+                    subject = _clean_visual_phrase(" ".join(t.text for t in subjects[0].subtree))
+                obj = ""
+                if objects:
+                    obj = _clean_visual_phrase(" ".join(t.text for t in objects[0].subtree))
+                # Retain useful place phrases (in/on/under/above/near) but not
+                # abstract clauses such as "waiting to keep you company".
+                locations = []
+                for token in sent:
+                    if token.dep_ == "prep" and token.text.lower() in {
+                        "in", "on", "under", "above", "near", "beside", "across", "around"
+                    }:
+                        pobj = next((c for c in token.children if c.dep_ == "pobj"), None)
+                        if pobj:
+                            locations.append(f"{token.text} {_clean_visual_phrase(' '.join(t.text for t in pobj.subtree))}")
+                if subject:
+                    verb = root.lemma_.lower()
+                    action_map = {
+                        "be": "standing", "appear": "appearing", "emerge": "emerging",
+                        "grow": "growing", "bloom": "blooming", "shine": "shining",
+                        "flicker": "glowing", "glow": "glowing", "rise": "rising",
+                        "float": "floating", "fly": "flying", "run": "running",
+                        "walk": "walking", "sit": "sitting", "stand": "standing",
+                        "sleep": "sleeping", "dance": "dancing", "fall": "falling",
+                        "move": "moving", "flow": "flowing", "burn": "burning",
+                        "spread": "spreading", "cover": "covering",
+                    }
+                    action = action_map.get(verb, verb if verb.endswith("ing") else verb + "ing")
+                    phrase = subject
+                    if obj and obj.lower() not in subject.lower():
+                        phrase += " with " + obj
+                    if locations:
+                        phrase += " " + locations[0]
+                    return f"{phrase[:1].upper() + phrase[1:]} {action}. Keep the scene clear and visually focused."
+        except Exception:
+            pass
+
+    # Fallback: remove dialogue, abstract/emotional clauses and simplify common
+    # narrative verbs while preserving the main concrete nouns.
+    raw = re.sub(r"\b(struggling|struggled|whispered|replied|said|thought|felt|wondered|remembered)\b[^,.!?]*",
+                 "", raw, flags=re.I)
+    raw = re.sub(r"\b(absolute|vast|gentle|finally|suddenly|quietly|softly)\b", "", raw, flags=re.I)
+    raw = re.sub(r"\s+", " ", raw).strip(" ,.;:-")
+    if not raw:
+        return ""
+    raw = re.sub(r"\bwas born\b", "appeared", raw, flags=re.I)
+    raw = re.sub(r"\bwere born\b", "appeared", raw, flags=re.I)
+    raw = re.sub(r"\bwas populated with\b", "filled with", raw, flags=re.I)
+    raw = re.sub(r"\bwere populated with\b", "filled with", raw, flags=re.I)
+    return raw[:1].upper() + raw[1:] + ("" if raw.endswith(".") else ".")
+
+
+def simplify_story_scenes(scenes: list[str]) -> list[str]:
+    """Simplify extracted story beats into concise prompts suitable for image models."""
+    nlp = _load_spacy_pipeline()
+    simplified = []
+    for scene in scenes:
+        prompt = simplify_scene_for_image(scene, nlp)
+        if prompt:
+            simplified.append(prompt)
+    return simplified[:40]
+
+
+def extract_story_entities(story: str) -> list[dict[str, str]]:
+    """Extract named entities with spaCy when available; use a lightweight fallback."""
+    text = (story or "").strip()
+    if not text:
+        return []
+    nlp = _load_spacy_pipeline()
+    names = []
+    if nlp:
+        try:
+            doc = nlp(text)
+            names = [ent.text.strip() for ent in doc.ents
+                     if ent.label_ in {"PERSON", "GPE", "LOC", "ORG", "FAC", "PRODUCT"}]
+        except Exception:
+            names = []
+    if not names:
+        stop = {"The", "A", "An", "When", "While", "After", "Before", "Then", "One",
+                "Suddenly", "But", "And", "He", "She", "They", "It", "In", "On", "At"}
+        candidates = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\b", text)
+        names = [name for name in candidates if name.split()[0] not in stop]
+    counts = {}
+    for name in names:
+        counts[name] = counts.get(name, 0) + 1
+    results = []
+    for name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+        if count >= 1:
+            results.append({"name": name, "description": "Named character or place. Add its fixed visual appearance or design here."})
+    return results[:30]
 
 
 # --------------------------------------------------------------------------- #
@@ -221,6 +434,10 @@ def setup(force: bool = False):
 
     print("[4/5] Installing/upgrading diffusers, transformers, gguf, bitsandbytes...")
     run([py, "-m", "pip", "install", "--upgrade", *PACKAGES])
+    try:
+        run([py, "-m", "spacy", "download", "en_core_web_sm"])
+    except subprocess.CalledProcessError:
+        print("  (spaCy English model unavailable; story simplification will use its offline rules)")
 
     print("[5/5] Fetching Bootstrap CSS...")
     ensure_bootstrap()
@@ -343,6 +560,10 @@ select.form-select option:checked, select.form-select option:hover { background-
 .rating-meter > span.mid { background: #d39e00; }
 .rating-meter > span.low { background: #dc3545; }
 .rating-note { margin-top: .4rem; font-size: .7rem; color: var(--bs-secondary-color); line-height: 1.35; }
+.shape-options { display: grid !important; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; }
+.shape-options > label { min-width: 0; width: 100%; white-space: nowrap; }
+#panel, #panel .card-body, #panel .row, #panel [class*="col-"] { min-width: 0; }
+#panel .form-select, #panel .form-control { max-width: 100%; }
 
 </style>
 </head>
@@ -355,7 +576,7 @@ select.form-select option:checked, select.form-select option:hover { background-
         <h1 class="h2 mb-0">Image Gen Local</h1>
         <span class="badge rounded-pill badge-gpu">__GPU__</span>
       </div>
-      <p class="subtitle mb-0 mt-1">Local image generation. Nothing leaves this machine.</p>
+      <p class="subtitle mb-0 mt-1">Turn a complete story into a consistent sequence of images.</p>
     </div>
     <div style="min-width: 190px;">
       <select id="theme" class="form-select form-select-sm" aria-label="Colour theme"></select>
@@ -363,19 +584,32 @@ select.form-select option:checked, select.form-select option:hover { background-
   </header>
 
   <div class="row g-4">
-    <!-- controls -->
-    <div class="col-12 col-lg-5 col-xl-4 col-xxl-3">
-      <div class="card sticky-panel" id="panel">
-        <div class="card-body d-flex flex-column gap-3">
-          <textarea id="prompt" class="form-control" rows="5" placeholder="Describe what you want to see..."></textarea>
-          <div class="d-flex gap-2">
-            <button id="go" class="btn btn-primary flex-grow-1 py-2" type="button">
-              <span id="go-spin" class="spinner-border spinner-border-sm me-2 d-none" aria-hidden="true"></span>
-              <span id="go-text">Generate</span>
-            </button>
-            <button id="stop" class="btn btn-outline-secondary" type="button" disabled>Stop</button>
-          </div>
+    <!-- results -->
+    <div class="col-12">
+      <ul class="nav nav-tabs mb-3" role="tablist">
+        <li class="nav-item"><button class="nav-link" id="tab-res" type="button">Results</button></li>
+        <li class="nav-item"><button class="nav-link active" id="tab-story" type="button">Story Mode</button></li>
+        <li class="nav-item"><button class="nav-link" id="tab-his" type="button">History</button></li>
+        <li class="nav-item"><button class="nav-link" id="tab-logs" type="button">Terminal logs</button></li>
+      </ul>
 
+      <div id="pane-res" class="d-none">
+        <div id="empty" class="empty d-flex align-items-center justify-content-center text-center p-4">Your images will appear here.</div>
+        <div id="grid" class="row row-cols-1 row-cols-md-2 row-cols-xxl-3 g-3"></div>
+      </div>
+
+      <div id="pane-story">
+        <div id="progress-wrap" class="mb-2 d-none">
+          <div class="progress" role="progressbar" aria-label="Progress">
+            <div id="bar" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div>
+          </div>
+        </div>
+        <div id="status" class="small-note mb-3">Ready.</div>
+        <div class="row g-3">
+    
+    <div class="col-12">
+      <div class="card mb-3" id="story-options">
+        <div class="card-body d-flex flex-column gap-3">
           <div>
             <label class="form-label" for="style">Art style</label>
             <select id="style" class="form-select">
@@ -431,13 +665,15 @@ select.form-select option:checked, select.form-select option:hover { background-
           <div class="row g-2 align-items-end">
             <div class="col-12 col-sm-7">
               <label class="form-label d-block">Shape</label>
-              <div class="btn-group w-100" role="group" aria-label="Shape">
+              <div class="btn-group shape-options" role="group" aria-label="Output shape">
                 <input type="radio" class="btn-check" name="shape" id="sh-sq" value="Square" checked>
                 <label class="btn btn-outline-secondary btn-sm" for="sh-sq">Square</label>
                 <input type="radio" class="btn-check" name="shape" id="sh-po" value="Portrait">
                 <label class="btn btn-outline-secondary btn-sm" for="sh-po">Portrait</label>
                 <input type="radio" class="btn-check" name="shape" id="sh-la" value="Landscape">
                 <label class="btn btn-outline-secondary btn-sm" for="sh-la">Landscape</label>
+                <input type="radio" class="btn-check" name="shape" id="sh-yt" value="YouTube">
+                <label class="btn btn-outline-secondary btn-sm" for="sh-yt">YouTube 16:9</label>
               </div>
             </div>
             <div class="col-12 col-sm-5">
@@ -504,23 +740,42 @@ select.form-select option:checked, select.form-select option:hover { background-
       </div>
     </div>
 
-    <!-- results -->
-    <div class="col-12 col-lg-7 col-xl-8 col-xxl-9">
-      <ul class="nav nav-tabs mb-3" role="tablist">
-        <li class="nav-item"><button class="nav-link active" id="tab-res" type="button">Results</button></li>
-        <li class="nav-item"><button class="nav-link" id="tab-his" type="button">History</button></li>
-        <li class="nav-item"><button class="nav-link" id="tab-logs" type="button">Terminal logs</button></li>
-      </ul>
-
-      <div id="pane-res">
-        <div id="progress-wrap" class="mb-2 d-none">
-          <div class="progress" role="progressbar" aria-label="Progress">
-            <div id="bar" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%"></div>
+        </div>
+        <div class="row g-3">
+          <div class="col-12">
+            <div class="card"><div class="card-body">
+              <label class="form-label fw-semibold" for="story-input">Your complete story</label>
+              <textarea id="story-input" class="form-control" rows="10" placeholder="Paste or write the full story here. Separate scenes with headings such as Scene 1, Scene 2, Scene 3..."></textarea>
+              <div class="d-flex flex-wrap gap-2 mt-3">
+                <button id="story-extract" class="btn btn-primary" type="button">Extract scenes &amp; characters</button>
+                <button id="story-clear" class="btn btn-outline-secondary" type="button">Clear</button>
+              </div>
+              <div class="form-text mt-2">Use headings like “Scene 1”, “Scene 2”, etc. If no headings are found, the story is split into visual beats. Each beat is rewritten as a short, concrete image prompt; dialogue and abstract metaphors are filtered out. Review and edit every prompt before generating.</div>
+            </div></div>
+          </div>
+          <div class="col-12">
+            <div class="card"><div class="card-body">
+              <h3 class="h6">Characters &amp; recurring details</h3>
+              <div class="form-text mb-2">Review or edit the descriptions before generating. These details are added to every scene prompt to help maintain visual consistency.</div>
+              <textarea id="story-entities" class="form-control" rows="7" placeholder="Extracted characters and recurring details will appear here."></textarea>
+            </div></div>
+          </div>
+          <div class="col-12">
+            <div class="card"><div class="card-body">
+              <h3 class="h6">Simplified image prompts</h3>
+              <div id="story-scenes" class="d-flex flex-column gap-3">
+                <div class="text-body-secondary small">Extract your story to see editable scene prompts here.</div>
+              </div>
+            </div></div>
+          </div>
+          <div class="col-12">
+            <div class="card"><div class="card-body">
+              <div class="d-flex gap-2 mt-3"><button id="story-generate" class="btn btn-primary flex-grow-1 py-2" type="button">Generate all scene images</button><button id="stop" class="btn btn-outline-secondary" type="button" disabled>Stop</button></div>
+              <div id="story-progress" class="small text-body-secondary mt-2"></div>
+              <div id="story-grid" class="row row-cols-2 row-cols-md-3 g-2 mt-2"></div>
+            </div></div>
           </div>
         </div>
-        <div id="status" class="small-note mb-3">Ready.</div>
-        <div id="empty" class="empty d-flex align-items-center justify-content-center text-center p-4">Your images will appear here.</div>
-        <div id="grid" class="row row-cols-1 row-cols-md-2 row-cols-xxl-3 g-3"></div>
       </div>
 
       <div id="pane-his" class="d-none">
@@ -559,6 +814,7 @@ function dims(size, shape) {
   const r = (v) => Math.max(256, Math.min(1024, Math.round(v / 64) * 64));
   if (shape === "Portrait") return [size, r(size * 1.5)];
   if (shape === "Landscape") return [r(size * 1.5), size];
+  if (shape === "YouTube") return [r(size * (4 / 3)), r(size * 0.75)];
   return [size, size];
 }
 const shape = () => document.querySelector("input[name=shape]:checked").value;
@@ -596,6 +852,13 @@ function applyInfo(m, keepSize) {
 async function onModel() {
   const m = await api("/api/modelinfo?model=" + encodeURIComponent($("model").value));
   if (m.error) { $("status").textContent = m.error; return; }
+  if (Array.isArray(m.quants) && m.quants.length) {
+    const quant = $("quant");
+    const previous = quant.value;
+    quant.innerHTML = "";
+    m.quants.forEach((q) => { const option = el("option", null, q); option.value = q; quant.appendChild(option); });
+    quant.value = m.quants.includes(previous) ? previous : "Auto";
+  }
   applyInfo(m);
 }
 function onShape() { if (!curModel) return; const [w, h] = dims(curModel.size, shape()); setRange("width", w); setRange("height", h); }
@@ -612,6 +875,8 @@ function fillModels(list, keep) {
 
 function showImages(images) {
   const grid = $("grid"); grid.innerHTML = "";
+  const storyGrid = $("story-grid");
+  if (storyGrid) storyGrid.innerHTML = "";
   $("empty").classList.toggle("d-none", images.length > 0);
   images.forEach((im) => {
     const col = el("div", "col"), card = el("div", "card h-100 overflow-hidden");
@@ -621,6 +886,7 @@ function showImages(images) {
     foot.appendChild(el("span", "text-body-secondary", "seed " + im.seed));
     const a = el("a", "link-primary text-decoration-none", "Download"); a.href = im.url; a.download = im.name;
     foot.appendChild(a); card.appendChild(img); card.appendChild(foot); col.appendChild(card); grid.appendChild(col);
+    if (storyGrid) storyGrid.appendChild(col.cloneNode(true));
   });
 }
 function openLb(url) { $("lb-img").src = url; $("lightbox").style.display = "block"; }
@@ -628,9 +894,11 @@ $("lightbox").addEventListener("click", () => { $("lightbox").style.display = "n
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") $("lightbox").style.display = "none"; });
 
 function setRunning(r) {
-  $("go").disabled = r; $("stop").disabled = !r;
-  $("go-spin").classList.toggle("d-none", !r);
-  $("go-text").textContent = r ? "Generating..." : "Generate";
+  if ($("go")) $("go").disabled = r;
+  if ($("stop")) $("stop").disabled = !r;
+  if ($("go-spin")) $("go-spin").classList.toggle("d-none", !r);
+  if ($("go-text")) $("go-text").textContent = r ? "Generating..." : "Generate";
+  if ($("story-generate")) $("story-generate").disabled = r;
   $("progress-wrap").classList.toggle("d-none", !r);
 }
 async function poll() {
@@ -659,8 +927,6 @@ async function generate() {
   $("status").classList.remove("text-danger");
   setRunning(true); startPolling();
 }
-$("go").addEventListener("click", generate);
-$("prompt").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); generate(); } });
 $("stop").addEventListener("click", async () => { const r = await api("/api/stop", {}); $("status").textContent = r.message; });
 $("free").addEventListener("click", async () => { const r = await api("/api/free", {}); $("status").textContent = r.message; });
 $("open").addEventListener("click", async () => { const r = await api("/api/open", {}); $("status").textContent = r.message; });
@@ -671,7 +937,7 @@ $("adv-toggle").addEventListener("click", () => { $("adv").classList.toggle("sho
 
 let logsTimer = null;
 function selectTab(which) {
-  for (const [key, id] of [["res", "res"], ["his", "his"], ["logs", "logs"]]) {
+  for (const [key, id] of [["res", "res"], ["story", "story"], ["his", "his"], ["logs", "logs"]]) {
     $("tab-" + id).classList.toggle("active", which === key);
     $("pane-" + id).classList.toggle("d-none", which !== key);
   }
@@ -682,7 +948,80 @@ function selectTab(which) {
     logsTimer = setInterval(loadTerminalLogs, 1000);
   }
 }
+
+let storyScenes = [];
+let storyEntities = [];
+
+function renderStoryScenes() {
+  const root = $("story-scenes");
+  root.innerHTML = "";
+  if (!storyScenes.length) {
+    root.appendChild(el("div", "text-body-secondary small", "No scenes extracted yet."));
+    return;
+  }
+  storyScenes.forEach((scene, index) => {
+    const wrap = el("div", "border rounded p-3");
+    const head = el("div", "fw-semibold mb-2", "Scene " + (index + 1));
+    const area = document.createElement("textarea");
+    area.className = "form-control";
+    area.rows = 4;
+    area.value = scene;
+    area.addEventListener("input", () => { storyScenes[index] = area.value; });
+    wrap.appendChild(head);
+    wrap.appendChild(area);
+    root.appendChild(wrap);
+  });
+}
+async function extractStory() {
+  const story = $("story-input").value.trim();
+  if (!story) { $("status").textContent = "Enter your story first."; return; }
+  const result = await api("/api/story/parse", {story});
+  if (result.error) { $("status").textContent = result.error; return; }
+  storyScenes = result.scenes || [];
+  storyEntities = result.entities || [];
+  $("story-entities").value = storyEntities.map(x => x.name + ": " + x.description).join("\n");
+  renderStoryScenes();
+  $("status").textContent = `Extracted ${storyScenes.length} scenes and ${storyEntities.length} recurring details. Review and edit them before generating.`;
+}
+$("story-extract").addEventListener("click", extractStory);
+$("story-clear").addEventListener("click", () => {
+  $("story-input").value = "";
+  $("story-entities").value = "";
+  storyScenes = [];
+  storyEntities = [];
+  renderStoryScenes();
+  $("story-progress").textContent = "";
+  $("status").textContent = "Story cleared.";
+});
+$("story-generate").addEventListener("click", async () => {
+  if (!storyScenes.length) { $("status").textContent = "Extract your story scenes first."; return; }
+  const entities = $("story-entities").value.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  const result = await api("/api/story/generate", {
+    scenes: storyScenes,
+    entities,
+    model: $("model").value,
+    style: $("style").value,
+    negative: $("negative").value,
+    width: +$("width").value,
+    height: +$("height").value,
+    steps: +$("steps").value,
+    cfg: +$("cfg").value,
+    count: +$("count").value,
+    seed: $("seed").value === "" ? -1 : +$("seed").value,
+    quant: $("quant").value,
+    precision: $("precision").value,
+    token: $("token").value,
+    family: $("family").value,
+    force_sdxl: $("force-sdxl").checked,
+    sampler: $("sampler").value
+  });
+  if (result.error) { $("status").textContent = result.error; return; }
+  $("story-progress").textContent = "Generating scene images in order…";
+  setRunning(true);
+  startPolling();
+});
 $("tab-res").addEventListener("click", () => selectTab("res"));
+$("tab-story").addEventListener("click", () => selectTab("story"));
 $("tab-his").addEventListener("click", () => selectTab("his"));
 $("tab-logs").addEventListener("click", () => selectTab("logs"));
 async function loadTerminalLogs() {
@@ -736,6 +1075,7 @@ function applyTheme(name) {
   $("token-note").textContent = CFG.has_token ? "A saved token is in use; paste one here to override it." : "Optional. Public ungated models download without accepting a licence; token is used only for authenticated Hub access.";
   fillModels(CFG.models, CFG.default_model); $("model").value = CFG.default_model;
   await onModel();
+  selectTab("story");
   const s = await api("/api/status");
   if (s.running) { setRunning(true); startPolling(); } else if ((s.images || []).length) showImages(s.images);
 })();
@@ -878,16 +1218,27 @@ def run_app(args):
             files={"Q4_K_S": "dreamshaper-xl-v2-turbo-Q4_K_S.gguf", "Q8_0": "dreamshaper-xl-v2-turbo-Q8_0.gguf"},
             steps=6, cfg=1.5, size=768, sampler="euler",
             info="Fast SDXL Turbo model for creative, painterly, illustrative and semi-realistic images. A good first choice for watercolor, gouache, sketch and dreamy style recipes. Model-card settings: 6 steps, CFG 1.5, Euler."),
-        "03 | RealVisXL v5 | Higher-quality photorealism": dict(quality_rating=9.1, speed_rating=6.0, rating_note="Estimated for GTX 1660 6GB at 768×768, Q4_K_S, one image; not a measured benchmark. Higher speed score means faster.",
+        "01 | RealVisXL v5 | Photorealism": dict(quality_rating=9.1, speed_rating=6.0, rating_note="Estimated for GTX 1660 6GB at 768×768, Q4_K_S, one image; not a measured benchmark. Higher speed score means faster.",
             repo="off-grid-ai/realvisxl-v5.0-GGUF",
             files={"Q4_K_S": "realvisxl-v5.0-Q4_K_S.gguf", "Q8_0": "realvisxl-v5.0-Q8_0.gguf"},
             steps=24, cfg=5.0, size=768, sampler="dpm++2m",
             info="Higher-quality photorealistic SDXL. Slower than Lightning; model card recommends 24 steps, CFG 5 and DPM++ 2M."),
-        "04 | Juggernaut XL v9 | Versatile realism": dict(quality_rating=9.2, speed_rating=6.0, rating_note="Estimated for GTX 1660 6GB at 768×768, Q4_K_S, one image; not a measured benchmark. Higher speed score means faster.",
+        "02 | Juggernaut XL v9 | Cinematic realism": dict(quality_rating=9.2, speed_rating=6.0, rating_note="Estimated for GTX 1660 6GB at 768×768, Q4_K_S, one image; not a measured benchmark. Higher speed score means faster.",
             repo="off-grid-ai/juggernaut-xl-v9-GGUF",
             files={"Q4_K_S": "juggernaut-xl-v9-Q4_K_S.gguf", "Q8_0": "juggernaut-xl-v9-Q8_0.gguf"},
             steps=24, cfg=5.0, size=768, sampler="dpm++2m",
             info="Versatile SDXL checkpoint for cinematic, photographic and general-purpose images. Slower high-detail profile: 24 steps, CFG 5, DPM++ 2M."),
+        "03 | CyberRealistic v9 | Z-Image Turbo | Photorealism": dict(
+            quality_rating=9.3, speed_rating=4.8,
+            rating_note="Estimated, not benchmarked, for GTX 1660 6GB + 16GB system RAM. Uses Q4_K diffusion GGUF, Q4_K_M Qwen encoder, 8 steps and CPU offload. Approximately 1MP; slower than the previous Q3_K/4-step profile.",
+            repo="gimly13/z-image-cyberrealistic-v9-gguf",
+            files={"Q3_K": "zit_CyberRealistic_v9-Q3_K.gguf",
+                   "Q4_K_S": "zit_CyberRealistic_v9-Q4_K_S.gguf",
+                   "Q4_K": "zit_CyberRealistic_v9-Q4_K.gguf"},
+            default_quant="Q4_K", steps=8, cfg=1.0, size=1024, sampler="euler",
+            components={"clip_l": "clip/Qwen3-4B-Q4_K_M.gguf", "vae": "vae/ae.safetensors"},
+            architecture="z-image",
+            info="Photorealistic Z-Image Turbo fine-tune. Source-tested v9 starting profile: Q4_K diffusion, Qwen3-4B Q4_K_M encoder, 8 steps, CFG 1.0, Euler, approximately 1MP. Uses CPU offload on 6GB GPUs; expect slower generation. CyberRealistic-specific prompt normalization removes scene labels and explicitly requests one continuous image frame, while preserving the scene's intended subject count. Negative prompts are not passed for this Turbo architecture."),
         "05 | Illustrious XL v2 | Anime / illustration": dict(quality_rating=9.2, speed_rating=5.8, rating_note="Estimated for GTX 1660 6GB at 768×768, Q4_K_S, one image; not a measured benchmark. Higher speed score means faster.",
             repo="off-grid-ai/illustrious-xl-v2.0-GGUF",
             files={"Q4_K_S": "illustrious-xl-v2.0-Q4_K_S.gguf", "Q8_0": "illustrious-xl-v2.0-Q8_0.gguf"},
@@ -923,7 +1274,12 @@ def run_app(args):
         "oil": "expressive oil painting, visible impasto brush strokes, rich pigment, painterly color mixing, artful canvas texture, confident composition",
         "concept": "high-end fantasy concept art, imaginative worldbuilding, cinematic composition, atmospheric depth, painterly details, evocative lighting"
     }
-    SDC_DEFAULT_LABEL = next(iter(SDC_MODELS))
+    # Keep the supported photorealism and illustration choices in the UI.
+    SDC_MODELS = {
+        name: spec for name, spec in SDC_MODELS.items()
+        if ("RealVisXL v5 |" in name) or ("Juggernaut XL v9 |" in name) or ("CyberRealistic v9 |" in name)
+    }
+    SDC_DEFAULT_LABEL = next(name for name in SDC_MODELS if name.startswith("01 |"))
     # best quality first; Auto walks this list
     QUANTS = ["Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q4_K_M", "Q4_K_S", "Q4_0", "Q3_K_M", "Q3_K_S", "Q2_K"]
     QUANT_FALLBACK = ["Q4_K_M", "Q4_K_S", "Q4_0", "Q3_K_M", "Q3_K_S", "Q2_K", "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0"]
@@ -1199,7 +1555,7 @@ def run_app(args):
             raise
         return destination
 
-    def ensure_sd_cpp():
+    def ensure_sd_cpp(require_zimage=False):
         if os.name != "nt":
             raise UserError("This backend installer is configured for native Windows. Run the app on Windows.")
         if SDC_EXE.exists() and (SDC_BIN_DIR / "stable-diffusion.dll").exists():
@@ -1211,7 +1567,9 @@ def run_app(args):
                                        encoding="utf-8", errors="replace",
                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 help_text = (probe.stdout or "") + (probe.stderr or "")
-                if "--offload-to-cpu" in help_text and "--auto-fit" in help_text:
+                required = ["--offload-to-cpu", "--auto-fit", "--ip-adapter", "--clip_vision"]
+                has_zimage_cli = "--llm" in help_text and "--vae" in help_text and "--diffusion-model" in help_text
+                if all(flag in help_text for flag in required) and (not require_zimage or has_zimage_cli):
                     return str(SDC_EXE)
                 print("Installed stable-diffusion.cpp is older than the RAM auto-fit interface; updating it...", flush=True)
             except Exception as e:
@@ -1297,19 +1655,21 @@ def run_app(args):
                                encoding="utf-8", errors="replace",
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         probe_text = (probe.stdout or "") + (probe.stderr or "")
-        if probe.returncode not in (0, 1) or "img_gen" not in probe_text.lower():
+        has_zimage_cli = "--llm" in probe_text and "--vae" in probe_text and "--diffusion-model" in probe_text
+        if (probe.returncode not in (0, 1) or "img_gen" not in probe_text.lower()
+                or (require_zimage and not has_zimage_cli)):
             raise UserError(
                 "The native Windows engine was downloaded but failed its startup/CLI validation. "
-                "This is usually a missing or mismatched DLL. Full validation output:\n" + probe_text[-3000:]
+                "This is usually a missing/mismatched DLL or missing Z-Image CLI support. Full validation output:\n" + probe_text[-3000:]
             )
         print(f"Native stable-diffusion.cpp ready: {SDC_EXE}", flush=True)
         print(f"Release: {release.get('tag_name', 'latest')} | CUDA 12 Windows x64", flush=True)
         return str(SDC_EXE)
 
-    def ensure_sdc_model(spec, quant="Q4_K_S", token=None):
+    def ensure_sdc_model(spec, quant="Auto", token=None):
         files = spec["files"]
-        # Auto is deliberately conservative on a 6 GB card; Q8 is an explicit quality choice.
-        quant = "Q4_K_S" if quant in (None, "", "Auto") else quant
+        # Keep the 6 GB profile conservative. Models can override the Auto quant.
+        quant = spec.get("default_quant", "Q4_K_S") if quant in (None, "", "Auto") else quant
         if quant not in files:
             raise UserError(f"{spec['label']} has no {quant} quant. Available: {', '.join(files)}")
         filename = files[quant]
@@ -1333,18 +1693,93 @@ def run_app(args):
         except Exception as e:
             raise UserError(f"Could not download {filename} from Hugging Face ({repo}): {e}")
 
+    def ensure_sdc_component(spec, relative_filename, token=None):
+        """Download and validate a companion file from the same public GGUF bundle."""
+        repo = spec["repo"]
+        repo_dir = MODELS_DIR / "sd_cpp_models" / repo.replace("/", "__")
+        target = repo_dir / relative_filename
+        # The encoder is ~2.5 GB and the VAE ~335 MB; reject partial/HTML downloads.
+        minimum_size = 1_000_000_000 if relative_filename.lower().endswith(".gguf") else 100_000_000
+        if target.exists() and target.stat().st_size >= minimum_size:
+            return target
+        if args.offline:
+            raise UserError(f"Offline mode: required companion {relative_filename} is missing. Download it from https://huggingface.co/{repo}/blob/main/{relative_filename} into {repo_dir}.")
+        setmsg(0.30, f"Downloading required {Path(relative_filename).name} companion ...")
+        try:
+            from huggingface_hub import hf_hub_download
+            downloaded = hf_hub_download(repo_id=repo, filename=relative_filename,
+                                         local_dir=str(repo_dir), token=token or None)
+            result = Path(downloaded)
+            if not result.exists() or result.stat().st_size < minimum_size:
+                raise RuntimeError(f"downloaded companion is unexpectedly small ({result.stat().st_size if result.exists() else 0} bytes)")
+            print(f"Companion ready: {result} ({result.stat().st_size / 1024**2:.0f} MiB)", flush=True)
+            return result
+        except Exception as e:
+            raise UserError(f"Could not download required companion {relative_filename} from Hugging Face ({repo}): {e}")
+
+    def prepare_cyberrealistic_prompt(raw_prompt):
+        """Prepare concise, affirmative natural-language prompts for CyberRealistic v9.
+
+        Z-Image Turbo does not use conventional negative conditioning. Avoid putting
+        unwanted concepts (collage, grid, duplicate people, etc.) into the positive
+        prompt as negated text: the text encoder can still attend to those concepts.
+        """
+        prompt = str(raw_prompt or "").strip()
+        # Remove screenplay labels and story-level production notes. In particular,
+        # cross-scene continuity instructions belong to the story planner, not one frame.
+        prompt = re.sub(r"(?im)^\s*(?:STORY\s+CONTINUITY|SCENE\s*#?\s*\d+)\s*:\s*", "", prompt)
+        prompt = re.sub(r"(?im)^\s*(?:SHOT|FRAME)\s*#?\s*\d+\s*:\s*", "", prompt)
+        prompt = re.sub(r"(?i)Maintain strict visual continuity across all scenes\.?", "", prompt)
+        prompt = re.sub(r"(?i)Use the same character appearance, clothing, proportions, and recurring object designs\.?", "", prompt)
+        prompt = re.sub(r"(?i)Do not add captions, lettering, subtitles, or watermarks\.?", "", prompt)
+        prompt = re.sub(r"(?i)\b(?:the\s+)?same\b[^.]{0,100}\b(?:in|across)\s+(?:all|every)\s+scenes\.?", "", prompt)
+        prompt = re.sub(r"\s+", " ", prompt).strip(" ,;\n")
+
+        # Reinforce singular subject count with positive wording only. Do not inject
+        # a list of forbidden objects/layouts into the prompt.
+        singular_human = bool(re.search(
+            r"\b(?:a|one|single|the)\s+(?:young\s+|old\s+|adult\s+)?(?:human|person|man|woman|boy|girl)\b",
+            prompt, re.I))
+        multiple_humans = bool(re.search(
+            r"\b(?:two|three|four|five|six|several|many|multiple|crowd|group\s+of|people|men|women|children)\b",
+            prompt, re.I))
+        if singular_human and not multiple_humans:
+            prompt += " The scene shows one person as the sole human subject."
+
+        # Keep the prompt affirmative and photographic; avoid negated layout keywords.
+        prompt += " A natural, realistic photograph with one clear camera viewpoint."
+        return prompt
+
     def run_sdcpp_image(p, spec, seed, output_path, index, count):
-        exe = ensure_sd_cpp()
-        model, quant = ensure_sdc_model(spec, p.get("quant", "Auto"),
-                                        (p.get("token") or "").strip() or hf_token or None)
+        exe = ensure_sd_cpp(require_zimage=bool(spec.get("components")))
+        token = (p.get("token") or "").strip() or hf_token or None
+        components = {}
+        encoder_flag = None
+        if spec.get("components"):
+            # Validate backend compatibility before downloading several GB of model files.
+            probe = subprocess.run([str(exe), "--help"], cwd=str(SDC_BIN_DIR), capture_output=True,
+                                   text=True, timeout=30, encoding="utf-8", errors="replace",
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            help_text = (probe.stdout or "") + (probe.stderr or "")
+            encoder_flag = "--llm" if "--llm" in help_text else None
+            if not encoder_flag or "--vae" not in help_text:
+                raise UserError("Your installed stable-diffusion.cpp build lacks the required Z-Image options (--diffusion-model, --llm, and --vae). Update the native backend to the latest official release, then retry.")
+        model, quant = ensure_sdc_model(spec, p.get("quant", "Auto"), token)
+        if spec.get("components"):
+            for component_name, relative_filename in spec["components"].items():
+                components[component_name] = ensure_sdc_component(spec, relative_filename, token)
         width, height = int(p["width"]), int(p["height"])
         width = max(512, min(1024, round(width / 64) * 64))
         height = max(512, min(1024, round(height / 64) * 64))
         steps = max(1, min(40, int(p.get("steps", spec["steps"]))))
         cfg = max(0.0, min(10.0, float(p.get("cfg", spec["cfg"]))))
         prompt = (p.get("prompt") or "").strip()
+        if spec.get("architecture") == "z-image":
+            prompt = prepare_cyberrealistic_prompt(prompt)
+            print("CyberRealistic normalized prompt:", prompt, flush=True)
         negative = (p.get("negative") or "").strip()
-        command = [exe, "-M", "img_gen", "-m", str(model), "-p", prompt,
+        model_flag = "--diffusion-model" if spec.get("architecture") == "z-image" else "-m"
+        command = [exe, "-M", "img_gen", model_flag, str(model), "-p", prompt,
                    "-o", str(output_path), "-W", str(width), "-H", str(height),
                    "--steps", str(steps), "--cfg-scale", str(cfg),
                    "--sampling-method", spec.get("sampler", "euler"), "--seed", str(seed),
@@ -1353,9 +1788,13 @@ def run_app(args):
                    "--backend", "cuda0", "--offload-to-cpu", "--auto-fit", "on",
                    "--max-vram", str(max(2.0, min(4.5, torch.cuda.get_device_properties(0).total_memory / GIB - 1.2))),
                    "--mmap"]
-        if negative:
+        if components:
+            command += [encoder_flag, str(components["clip_l"]), "--vae", str(components["vae"])]
+        # Z-Image Turbo is distilled at CFG 1.0; negative prompts are not part of
+        # the verified CyberRealistic v9 recipe and are intentionally omitted.
+        if negative and not spec.get("architecture") == "z-image":
             command += ["-n", negative]
-        print("Launching native Windows sd.cpp:", subprocess.list2cmdline(command), flush=True)
+        print("Launching native Windows sd.cpp CUDA:", subprocess.list2cmdline(command), flush=True)
         setmsg((index / count), f"Image {index + 1}/{count} | starting native stable-diffusion.cpp ...")
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         proc = subprocess.Popen(command, cwd=str(SDC_BIN_DIR), stdout=subprocess.PIPE,
@@ -1414,7 +1853,7 @@ def run_app(args):
         cfg = float(p.get("cfg", spec["cfg"]))
         started = time.time()
         selected_quant = p.get("quant", "Auto")
-        selected_quant = "Q4_K_S" if selected_quant in (None, "", "Auto") else selected_quant
+        selected_quant = spec.get("default_quant", "Q4_K_S") if selected_quant in (None, "", "Auto") else selected_quant
         print(f"Using native stable-diffusion.cpp CUDA | {spec['label']} | {p.get('width')}x{p.get('height')} | {steps} steps | CFG {cfg} | quant {selected_quant}", flush=True)
         for i in range(count):
             if job["stop"]:
@@ -1429,7 +1868,8 @@ def run_app(args):
             for key, value in (("prompt", prompt), ("style_preset", style_key), ("effective_prompt", effective_prompt),
                                ("negative_prompt", p.get("negative", "")), ("seed", seed), ("model", spec["label"]), ("backend", "stable-diffusion.cpp"),
                                ("steps", steps), ("cfg", cfg), ("resolution", f"{p['width']}x{p['height']}"),
-                               ("quantization", selected_quant), ("compute_backend", "CUDA (native Windows)"), ("parameter_backend", "RAM offload / auto-fit")):
+                               ("quantization", selected_quant), ("compute_backend", "CUDA (native Windows)"), ("parameter_backend", "RAM offload / auto-fit"),
+                               ("sampler", p.get("sampler", ""))):
                 meta.add_text(key, str(value))
             # Rewrite with app metadata while retaining the decoded pixels.
             img.save(output_path, format="PNG", pnginfo=meta)
@@ -1997,7 +2437,8 @@ def run_app(args):
                 return self._json(dict(info=re.sub(r"\*\*", "", s["info"]), steps=s["steps"], cfg=s["cfg"],
                                        size=s["size"], gguf=s["gguf"], local_gguf=s["local_gguf"], kind=s["kind"],
                                        quality_rating=s.get("quality_rating"), speed_rating=s.get("speed_rating"),
-                                       rating_note=s.get("rating_note")))
+                                       rating_note=s.get("rating_note"),
+                                       quants=["Auto"] + list(s.get("files", {}).keys())))
             if route == "/api/status":
                 with job_lock:
                     return self._json(dict(job))
@@ -2016,10 +2457,100 @@ def run_app(args):
                 return self._send(415, b"json only", "text/plain")
             try:
                 n = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(min(n, 1_000_000)) or b"{}")
+                body = json.loads(self.rfile.read(min(n, 20_000_000)) or b"{}")
             except Exception:
                 return self._json(dict(error="Bad request."), 400)
             route = urlparse(self.path).path
+            if route == "/api/story/parse":
+                try:
+                    story = str(body.get("story") or "").strip()
+                    if not story:
+                        return self._json(dict(error="Enter a story first."), 400)
+                    raw_scenes = parse_story_scenes(story)
+                    scenes = simplify_story_scenes(raw_scenes)
+                    entities = extract_story_entities(story)
+                    return self._json(dict(scenes=scenes, entities=entities))
+                except Exception as exc:
+                    return self._json(dict(error=f"Could not parse story: {exc}"), 400)
+            if route == "/api/story/generate":
+                with job_lock:
+                    if job["running"]:
+                        return self._json(dict(error="A generation is already running."))
+                scenes = body.get("scenes") or []
+                if not isinstance(scenes, list) or not scenes:
+                    return self._json(dict(error="No scenes were provided."))
+                if len(scenes) > 40:
+                    return self._json(dict(error="Please keep a story to 40 scenes or fewer."))
+                entities = body.get("entities") or []
+                if not isinstance(entities, list):
+                    entities = []
+                common = (
+                    "Maintain strict visual continuity across all scenes. "
+                    "Use the same character appearance, clothing, proportions, and recurring object designs. "
+                    "Do not add captions, lettering, subtitles, or watermarks."
+                )
+                entity_text = "\n".join(str(x) for x in entities if str(x).strip())
+                prompts = []
+                for index, scene_text in enumerate(scenes):
+                    scene_text = str(scene_text or "").strip()
+                    if not scene_text:
+                        continue
+                    prompt = "\n\n".join(x for x in (
+                        "STORY CONTINUITY:\n" + entity_text if entity_text else "",
+                        common,
+                        f"SCENE {index + 1}:\n{scene_text}"
+                    ) if x)
+                    prompts.append(prompt)
+                if not prompts:
+                    return self._json(dict(error="All scene prompts are empty."))
+                generation = {
+                    "scenes": prompts,
+                    "model": body.get("model", first),
+                    "style": body.get("style", "none"),
+                    "negative": body.get("negative", DEFAULT_NEG),
+                    "width": int(body.get("width", 768)),
+                    "height": int(body.get("height", 768)),
+                    "steps": int(body.get("steps", 24)),
+                    "cfg": float(body.get("cfg", 5.0)),
+                    "count": max(1, min(8, int(body.get("count", 1)))),
+                    "seed": int(body.get("seed", -1)),
+                    "quant": body.get("quant", "Auto"),
+                    "precision": body.get("precision", "auto"),
+                    "token": body.get("token", ""),
+                    "family": body.get("family", "auto"),
+                    "force_sdxl": bool(body.get("force_sdxl", False)),
+                    "sampler": body.get("sampler", "Euler a"),
+                }
+                def story_batch():
+                    try:
+                        for index, prompt in enumerate(generation["scenes"]):
+                            if job.get("stop"):
+                                break
+                            scene_payload = dict(generation)
+                            scene_payload.pop("scenes", None)
+                            scene_payload["prompt"] = prompt
+                            with job_lock:
+                                job.update(progress=0.0, message=f"Story: generating scene {index + 1} of {len(prompts)}",
+                                           error=None)
+                            generate(scene_payload)
+                        with job_lock:
+                            if not job.get("stop"):
+                                job["message"] = f"Finished {len(prompts)} story scenes."
+                    except UserError as exc:
+                        with job_lock:
+                            job["error"] = str(exc)
+                    except Exception as exc:
+                        traceback.print_exc()
+                        with job_lock:
+                            job["error"] = f"Story generation failed: {exc}"
+                    finally:
+                        with job_lock:
+                            job["running"] = False
+                with job_lock:
+                    job.update(running=True, progress=0.0, message="Starting story generation…",
+                               images=[], error=None, stop=False)
+                threading.Thread(target=story_batch, daemon=True).start()
+                return self._json(dict(ok=True, scene_count=len(prompts)))
             if route == "/api/generate":
                 with job_lock:
                     if job["running"]:
