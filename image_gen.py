@@ -30,6 +30,9 @@ Options:
 Everything lives in ./localgen_data. Delete that folder to uninstall. No telemetry, no cloud.
 """
 import argparse
+import base64
+import binascii
+import io
 import json
 import os
 import re
@@ -45,13 +48,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 
-SETUP_VERSION = "9"  # spaCy-based story-to-visual-prompt simplification
+SETUP_VERSION = "9"  # no environment rebuild required for UI/backend-only updates
 ROOT = Path(__file__).resolve().parent / "localgen_data"
 SDCPP_DIR = ROOT / "sd_cpp"
 VENV_DIR = ROOT / "venv"
 MODELS_DIR = ROOT / "models"
 OUTPUT_DIR = ROOT / "outputs"
 STATIC_DIR = ROOT / "static"
+STORY_REF_DIR = ROOT / "story_refs"
 MARKER = ROOT / ".setup_done"
 BOOTSTRAP_VERSION = "5.3.3"
 BOOTSTRAP_URL = f"https://cdn.jsdelivr.net/npm/bootstrap@{BOOTSTRAP_VERSION}/dist/css/bootstrap.min.css"
@@ -755,6 +759,34 @@ select.form-select option:checked, select.form-select option:hover { background-
           </div>
           <div class="col-12">
             <div class="card"><div class="card-body">
+              <div class="d-flex flex-wrap justify-content-between align-items-start gap-2">
+                <div>
+                  <h3 class="h6 mb-1">Story reference image <span class="badge text-bg-secondary">Optional</span></h3>
+                  <div class="form-text">Upload one visual example to guide the look of every scene. Scene prompts still control the action and composition.</div>
+                </div>
+                <button id="story-ref-remove" class="btn btn-sm btn-outline-secondary" type="button" disabled>Remove image</button>
+              </div>
+              <div class="row g-3 align-items-center mt-1">
+                <div class="col-12 col-md-7">
+                  <label class="form-label" for="story-ref-file">Reference image</label>
+                  <input id="story-ref-file" class="form-control" type="file" accept="image/png,image/jpeg,image/webp">
+                  <div class="form-text">PNG, JPG or WebP. The browser resizes it before local upload. Nothing is sent to a cloud image service.</div>
+                </div>
+                <div class="col-12 col-md-5">
+                  <label class="form-label" for="story-ref-strength">Photo transformation: <span id="story-ref-strength-v">0.55</span></label>
+                  <input id="story-ref-strength" class="form-range" type="range" min="0.20" max="1" step="0.05" value="0.55">
+                  <div class="d-flex justify-content-between small-note"><span>Keep photo more</span><span>Change photo more</span></div>
+                </div>
+              </div>
+              <div id="story-ref-preview-wrap" class="d-none mt-3 d-flex align-items-center gap-3">
+                <img id="story-ref-preview" alt="Story reference preview" class="rounded border" style="width:112px;height:112px;object-fit:cover;background:var(--card2)">
+                <div class="small"><div id="story-ref-name" class="fw-semibold"></div><div id="story-ref-status" class="text-body-secondary">Ready to use for all scenes.</div></div>
+              </div>
+              <div class="alert alert-info-soft py-2 px-3 mt-3 mb-0 small">CyberRealistic v9 uses image-to-image conditioning: your photo becomes the starting image, and the scene prompt transforms it. Lower strength preserves more of the original photo; higher strength lets the scene prompt change it more. SDXL GGUF models use IP-Adapter Plus. Classic Diffusers models are not supported by this Story reference control.</div>
+            </div></div>
+          </div>
+          <div class="col-12">
+            <div class="card"><div class="card-body">
               <h3 class="h6">Characters &amp; recurring details</h3>
               <div class="form-text mb-2">Review or edit the descriptions before generating. These details are added to every scene prompt to help maintain visual consistency.</div>
               <textarea id="story-entities" class="form-control" rows="7" placeholder="Extracted characters and recurring details will appear here."></textarea>
@@ -779,6 +811,24 @@ select.form-select option:checked, select.form-select option:hover { background-
       </div>
 
       <div id="pane-his" class="d-none">
+        <div id="history-edit-panel" class="card mb-3 d-none"><div class="card-body">
+          <div class="d-flex justify-content-between align-items-start gap-2 mb-3">
+            <div><h3 class="h6 mb-1">Edit selected image</h3><div class="form-text">CyberRealistic v9 will use the selected image as its starting point. Keep the edit subtle to preserve its style.</div></div>
+            <button id="history-edit-cancel" class="btn btn-sm btn-outline-secondary" type="button">Close</button>
+          </div>
+          <div class="row g-3 align-items-start">
+            <div class="col-12 col-md-4"><img id="history-edit-preview" class="img-fluid rounded border w-100" alt="Selected history image" style="max-height:280px;object-fit:contain;background:var(--card2)"><div id="history-edit-name" class="small text-body-secondary mt-2"></div></div>
+            <div class="col-12 col-md-8">
+              <label class="form-label" for="history-edit-prompt">What should change?</label>
+              <textarea id="history-edit-prompt" class="form-control" rows="4" placeholder="Example: Change the man's jacket to a dark blue coat. Keep his face, pose, background, lighting and overall style unchanged."></textarea>
+              <div class="form-text mb-3">Describe only the changes. Unmentioned elements should remain as they are.</div>
+              <label class="form-label" for="history-edit-strength">Change strength: <span id="history-edit-strength-v">0.28</span></label>
+              <input id="history-edit-strength" class="form-range" type="range" min="0.12" max="0.65" step="0.01" value="0.28">
+              <div class="d-flex justify-content-between small-note"><span>Preserve original</span><span>Allow more changes</span></div>
+              <div class="d-flex flex-wrap gap-2 mt-3"><button id="history-edit-run" class="btn btn-primary" type="button">Generate edited image</button><span id="history-edit-status" class="small text-body-secondary align-self-center"></span></div>
+            </div>
+          </div>
+        </div></div>
         <div id="hist-empty" class="empty d-flex align-items-center justify-content-center text-center p-4 d-none">Nothing generated yet.</div>
         <div id="hist" class="row row-cols-2 row-cols-md-3 row-cols-xl-4 row-cols-xxl-6 g-2"></div>
       </div>
@@ -909,7 +959,10 @@ async function poll() {
   $("status").classList.toggle("text-danger", !!s.error);
   showImages(s.images || []);
   setRunning(s.running);
-  if (!s.running) { clearInterval(timer); timer = null; }
+  if (!s.running) {
+    clearInterval(timer); timer = null;
+    if (!$("pane-his").classList.contains("d-none")) loadHistory();
+  }
 }
 function startPolling() { if (!timer) timer = setInterval(poll, 500); poll(); }
 
@@ -951,6 +1004,62 @@ function selectTab(which) {
 
 let storyScenes = [];
 let storyEntities = [];
+let storyReferenceData = "";
+let storyReferenceName = "";
+
+function clearStoryReference() {
+  storyReferenceData = "";
+  storyReferenceName = "";
+  $("story-ref-file").value = "";
+  $("story-ref-preview").removeAttribute("src");
+  $("story-ref-preview-wrap").classList.add("d-none");
+  $("story-ref-remove").disabled = true;
+  $("story-ref-status").textContent = "";
+}
+function prepareStoryReference(file) {
+  if (!file) return;
+  if (!/^image\/(png|jpeg|webp)$/.test(file.type)) {
+    $("status").textContent = "Choose a PNG, JPG or WebP image.";
+    $("story-ref-file").value = "";
+    return;
+  }
+  if (file.size > 20 * 1024 * 1024) {
+    $("status").textContent = "Reference image must be 20 MB or smaller.";
+    $("story-ref-file").value = "";
+    return;
+  }
+  const reader = new FileReader();
+  reader.onerror = () => { $("status").textContent = "Could not read the reference image."; };
+  reader.onload = () => {
+    const image = new Image();
+    image.onerror = () => { $("status").textContent = "This image could not be decoded."; };
+    image.onload = () => {
+      const maxSide = 1024;
+      const scale = Math.min(1, maxSide / Math.max(image.naturalWidth, image.naturalHeight));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+      canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+      const ctx = canvas.getContext("2d", {alpha:false});
+      ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+      storyReferenceData = canvas.toDataURL("image/jpeg", 0.88);
+      storyReferenceName = file.name;
+      $("story-ref-preview").src = storyReferenceData;
+      $("story-ref-name").textContent = file.name + " · " + canvas.width + " × " + canvas.height;
+      $("story-ref-status").textContent = "Ready. This reference will guide every scene in this story.";
+      $("story-ref-preview-wrap").classList.remove("d-none");
+      $("story-ref-remove").disabled = false;
+      $("status").textContent = "Story reference image ready.";
+    };
+    image.src = reader.result;
+  };
+  reader.readAsDataURL(file);
+}
+$("story-ref-file").addEventListener("change", (e) => prepareStoryReference(e.target.files && e.target.files[0]));
+$("story-ref-remove").addEventListener("click", clearStoryReference);
+$("story-ref-strength").addEventListener("input", () => {
+  $("story-ref-strength-v").textContent = Number($("story-ref-strength").value).toFixed(2);
+});
 
 function renderStoryScenes() {
   const root = $("story-scenes");
@@ -987,6 +1096,7 @@ $("story-extract").addEventListener("click", extractStory);
 $("story-clear").addEventListener("click", () => {
   $("story-input").value = "";
   $("story-entities").value = "";
+  clearStoryReference();
   storyScenes = [];
   storyEntities = [];
   renderStoryScenes();
@@ -1013,10 +1123,14 @@ $("story-generate").addEventListener("click", async () => {
     token: $("token").value,
     family: $("family").value,
     force_sdxl: $("force-sdxl").checked,
-    sampler: $("sampler").value
+    sampler: $("sampler").value,
+    reference_image: storyReferenceData,
+    reference_strength: +$("story-ref-strength").value
   });
   if (result.error) { $("status").textContent = result.error; return; }
-  $("story-progress").textContent = "Generating scene images in order…";
+  $("story-progress").textContent = storyReferenceData
+    ? "Generating scene images with your visual reference…"
+    : "Generating scene images in order…";
   setRunning(true);
   startPolling();
 });
@@ -1045,15 +1159,61 @@ $("logs-copy").addEventListener("click", async () => {
     setTimeout(() => { $("logs-copy").textContent = "Copy logs"; }, 1200);
   } catch (e) { $("logs-copy").textContent = "Copy unavailable"; }
 });
+let selectedHistoryImage = null;
 async function loadHistory() {
   const h = await api("/api/history"); const box = $("hist"); box.innerHTML = "";
   $("hist-empty").classList.toggle("d-none", h.items.length > 0);
   h.items.forEach((it) => {
-    const col = el("div", "col"), img = el("img", "img-fluid rounded hist-thumb w-100");
+    const col = el("div", "col"), card = el("div", "card h-100 p-2");
+    const img = el("img", "img-fluid rounded hist-thumb w-100");
     img.src = it.url; img.loading = "lazy"; img.title = (it.prompt || "") + "\nseed " + it.seed;
-    img.addEventListener("click", () => openLb(it.url)); col.appendChild(img); box.appendChild(col);
+    img.addEventListener("click", () => openLb(it.url));
+    const foot = el("div", "d-flex justify-content-between align-items-center gap-1 mt-2");
+    const caption = el("span", "small text-body-secondary text-truncate", it.model || it.name);
+    const edit = el("button", "btn btn-sm btn-outline-primary flex-shrink-0", "Edit");
+    edit.type = "button"; edit.addEventListener("click", () => chooseHistoryImage(it));
+    foot.appendChild(caption); foot.appendChild(edit); card.appendChild(img); card.appendChild(foot);
+    col.appendChild(card); box.appendChild(col);
   });
 }
+function chooseHistoryImage(item) {
+  selectedHistoryImage = item;
+  $("history-edit-preview").src = item.url;
+  $("history-edit-name").textContent = item.name + (item.model ? " · " + item.model : "");
+  $("history-edit-prompt").value = "";
+  $("history-edit-strength").value = "0.28";
+  $("history-edit-strength-v").textContent = "0.28";
+  $("history-edit-status").textContent = "Ready. Describe the specific changes you want.";
+  $("history-edit-panel").classList.remove("d-none");
+  $("history-edit-panel").scrollIntoView({behavior:"smooth", block:"start"});
+  $("history-edit-prompt").focus();
+}
+$("history-edit-cancel").addEventListener("click", () => {
+  selectedHistoryImage = null;
+  $("history-edit-panel").classList.add("d-none");
+});
+$("history-edit-strength").addEventListener("input", () => {
+  $("history-edit-strength-v").textContent = Number($("history-edit-strength").value).toFixed(2);
+});
+$("history-edit-run").addEventListener("click", async () => {
+  if (!selectedHistoryImage) return;
+  const instruction = $("history-edit-prompt").value.trim();
+  if (!instruction) { $("history-edit-status").textContent = "Describe what you want to change first."; return; }
+  const button = $("history-edit-run"); button.disabled = true;
+  $("history-edit-status").textContent = "Starting CyberRealistic edit…";
+  try {
+    const r = await api("/api/history/edit", {
+      name: selectedHistoryImage.name,
+      instruction,
+      strength: Number($("history-edit-strength").value)
+    });
+    if (r.error) { $("history-edit-status").textContent = r.error; return; }
+    $("history-edit-status").textContent = "Editing started. Watch the progress at the top; the new image will appear in History.";
+    setRunning(true); startPolling();
+  } catch (e) {
+    $("history-edit-status").textContent = "Could not start edit: " + e;
+  } finally { button.disabled = false; }
+});
 
 function applyTheme(name) {
   const t = CFG.themes[name] || "abyssal";
@@ -1159,7 +1319,7 @@ def run_app(args):
     from PIL.PngImagePlugin import PngInfo
     from tqdm.auto import tqdm as base_tqdm
 
-    for d in (MODELS_DIR, OUTPUT_DIR, STATIC_DIR):
+    for d in (MODELS_DIR, OUTPUT_DIR, STATIC_DIR, STORY_REF_DIR):
         d.mkdir(parents=True, exist_ok=True)
     have_bootstrap = ensure_bootstrap(args.offline)
     if not torch.cuda.is_available():
@@ -1559,8 +1719,8 @@ def run_app(args):
         if os.name != "nt":
             raise UserError("This backend installer is configured for native Windows. Run the app on Windows.")
         if SDC_EXE.exists() and (SDC_BIN_DIR / "stable-diffusion.dll").exists():
-            # Reuse the installed engine only if it supports the RAM auto-fit flags
-            # used by this build. Otherwise fetch a current official Windows binary.
+            # Reuse the installed engine only if it supports RAM auto-fit and IP-Adapter
+            # flags used by this build. Otherwise fetch a current official Windows binary.
             try:
                 probe = subprocess.run([str(SDC_EXE), "--help"], cwd=str(SDC_BIN_DIR),
                                        capture_output=True, text=True, timeout=30,
@@ -1571,7 +1731,7 @@ def run_app(args):
                 has_zimage_cli = "--llm" in help_text and "--vae" in help_text and "--diffusion-model" in help_text
                 if all(flag in help_text for flag in required) and (not require_zimage or has_zimage_cli):
                     return str(SDC_EXE)
-                print("Installed stable-diffusion.cpp is older than the RAM auto-fit interface; updating it...", flush=True)
+                print("Installed stable-diffusion.cpp lacks required RAM auto-fit / IP-Adapter options; updating it...", flush=True)
             except Exception as e:
                 print(f"Could not validate installed stable-diffusion.cpp ({e}); updating it...", flush=True)
             SDC_EXE.unlink(missing_ok=True)
@@ -1750,6 +1910,40 @@ def run_app(args):
         prompt += " A natural, realistic photograph with one clear camera viewpoint."
         return prompt
 
+    def ensure_sdxl_ip_adapter(token=None):
+        """Fetch the official SDXL Plus ViT-H adapter and matching CLIP-Vision-H encoder."""
+        adapter_dir = MODELS_DIR / "ip_adapter_sdxl_vit_h"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        assets = (
+            ("sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors", 700_000_000),
+            ("models/image_encoder/model.safetensors", 2_000_000_000),
+        )
+        resolved = {}
+        for remote_name, minimum in assets:
+            target = adapter_dir / remote_name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists() or target.stat().st_size < minimum:
+                if args.offline:
+                    raise UserError(
+                        "Offline mode: IP-Adapter weights are missing. Download the official SDXL Plus ViT-H "
+                        f"assets into {adapter_dir} while preserving these paths: {remote_name}."
+                    )
+                setmsg(0.08, f"Downloading IP-Adapter component {Path(remote_name).name} (first use only; large download)…")
+                try:
+                    downloaded = hf_hub_download(
+                        repo_id="h94/IP-Adapter", filename=remote_name,
+                        local_dir=str(adapter_dir), token=token or None
+                    )
+                    target = Path(downloaded)
+                    if not target.exists() or target.stat().st_size < minimum:
+                        raise RuntimeError(f"downloaded file is too small ({target.stat().st_size if target.exists() else 0} bytes)")
+                    print(f"IP-Adapter asset ready: {target} ({target.stat().st_size / 1024**3:.2f} GiB)", flush=True)
+                except Exception as exc:
+                    raise UserError(f"Could not download IP-Adapter component {remote_name}: {exc}")
+            resolved[remote_name] = target
+        return (resolved["sdxl_models/ip-adapter-plus_sdxl_vit-h.safetensors"],
+                resolved["models/image_encoder/model.safetensors"])
+
     def run_sdcpp_image(p, spec, seed, output_path, index, count):
         exe = ensure_sd_cpp(require_zimage=bool(spec.get("components")))
         token = (p.get("token") or "").strip() or hf_token or None
@@ -1788,6 +1982,32 @@ def run_app(args):
                    "--backend", "cuda0", "--offload-to-cpu", "--auto-fit", "on",
                    "--max-vram", str(max(2.0, min(4.5, torch.cuda.get_device_properties(0).total_memory / GIB - 1.2))),
                    "--mmap"]
+        reference_path = p.get("reference_image_path")
+        if reference_path:
+            # CyberRealistic v9 is a Z-Image Turbo fine-tune, not SDXL. Use
+            # the native img2img path (init image + denoising strength) rather
+            # than passing incompatible SDXL IP-Adapter weights to it.
+            strength = max(0.20, min(1.0, float(p.get("reference_strength", 0.55))))
+            probe = subprocess.run([str(exe), "--help"], cwd=str(SDC_BIN_DIR), capture_output=True,
+                                   text=True, timeout=30, encoding="utf-8", errors="replace",
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            help_text = (probe.stdout or "") + (probe.stderr or "")
+            if spec.get("architecture") == "z-image":
+                required_flags = ("--init-img", "--strength")
+                missing = [flag for flag in required_flags if flag not in help_text]
+                if missing:
+                    raise UserError("Your installed stable-diffusion.cpp build does not expose Z-Image img2img options (" + ", ".join(missing) + "). Update the native backend and retry.")
+                command += ["--init-img", str(reference_path), "--strength", str(strength)]
+                print(f"CyberRealistic img2img enabled | transformation strength {strength:.2f} | starting photo {reference_path}", flush=True)
+            else:
+                required_flags = ("--clip_vision", "--ip-adapter", "--ip-adapter-image", "--ip-adapter-strength")
+                missing = [flag for flag in required_flags if flag not in help_text]
+                if missing:
+                    raise UserError("Your installed stable-diffusion.cpp build does not expose IP-Adapter options (" + ", ".join(missing) + "). Update the native backend and retry.")
+                adapter_path, vision_path = ensure_sdxl_ip_adapter(token)
+                command += ["--clip_vision", str(vision_path), "--ip-adapter", str(adapter_path),
+                            "--ip-adapter-image", str(reference_path), "--ip-adapter-strength", str(strength)]
+                print(f"SDXL IP-Adapter enabled | strength {strength:.2f} | reference {reference_path}", flush=True)
         if components:
             command += [encoder_flag, str(components["clip_l"]), "--vae", str(components["vae"])]
         # Z-Image Turbo is distilled at CFG 1.0; negative prompts are not part of
@@ -1869,7 +2089,11 @@ def run_app(args):
                                ("negative_prompt", p.get("negative", "")), ("seed", seed), ("model", spec["label"]), ("backend", "stable-diffusion.cpp"),
                                ("steps", steps), ("cfg", cfg), ("resolution", f"{p['width']}x{p['height']}"),
                                ("quantization", selected_quant), ("compute_backend", "CUDA (native Windows)"), ("parameter_backend", "RAM offload / auto-fit"),
-                               ("sampler", p.get("sampler", ""))):
+                               ("sampler", p.get("sampler", "")),
+                               ("reference_image", bool(p.get("reference_image_path"))),
+                               ("reference_strength", p.get("reference_strength", "")),
+                               ("source_image", p.get("source_image_name", "")),
+                               ("edit_instruction", p.get("edit_instruction", ""))):
                 meta.add_text(key, str(value))
             # Rewrite with app metadata while retaining the decoded pixels.
             img.save(output_path, format="PNG", pnginfo=meta)
@@ -2188,6 +2412,8 @@ def run_app(args):
             selected_spec = get_spec(choice, p.get("force_sdxl", False), p.get("family", "auto"))
             if selected_spec["kind"] == "sdcpp":
                 return generate_sdcpp(p, selected_spec)
+            if p.get("reference_image_path"):
+                raise UserError("Story reference conditioning is currently available for native SDXL GGUF models only. Select an [sd.cpp] SDXL model, or remove the reference image.")
             pipe, spec, prec, plan = load_pipe(choice, p, token)
             sampler = spec.get("recommended_sampler") or sampler
         except UserError:
@@ -2368,13 +2594,14 @@ def run_app(args):
         out = []
         files = sorted(OUTPUT_DIR.glob("*.png"), key=lambda f: f.stat().st_mtime, reverse=True)[:limit]
         for f in files:
-            prompt, seed = "", ""
+            prompt, seed, model = "", "", ""
             try:
                 with Image.open(f) as im:
                     prompt, seed = im.text.get("prompt", ""), im.text.get("seed", "")
+                    model = im.text.get("model", "")
             except Exception:
                 pass
-            out.append(dict(url=f"/outputs/{f.name}", name=f.name, prompt=prompt, seed=seed))
+            out.append(dict(url=f"/outputs/{f.name}", name=f.name, prompt=prompt, seed=seed, model=model))
         return out
 
     class Handler(BaseHTTPRequestHandler):
@@ -2461,6 +2688,81 @@ def run_app(args):
             except Exception:
                 return self._json(dict(error="Bad request."), 400)
             route = urlparse(self.path).path
+            if route == "/api/history/edit":
+                with job_lock:
+                    if job["running"]:
+                        return self._json(dict(error="A generation is already running. Stop it or wait for it to finish."), 409)
+                filename = str(body.get("name") or "")
+                if not filename or Path(filename).name != filename or not filename.lower().endswith(".png"):
+                    return self._json(dict(error="Choose a valid image from History."), 400)
+                source_path = OUTPUT_DIR / filename
+                if not source_path.is_file():
+                    return self._json(dict(error="That history image no longer exists. Refresh History and select it again."), 404)
+                instruction = str(body.get("instruction") or "").strip()
+                if not instruction:
+                    return self._json(dict(error="Describe what you want to change."), 400)
+                if len(instruction) > 1600:
+                    return self._json(dict(error="Keep the edit instruction under 1,600 characters."), 400)
+                try:
+                    strength = max(0.12, min(0.65, float(body.get("strength", 0.28))))
+                    with Image.open(source_path) as source_image:
+                        source_image.verify()
+                    with Image.open(source_path) as source_image:
+                        source_width, source_height = source_image.size
+                        source_meta = dict(source_image.text)
+                    if source_width < 1 or source_height < 1 or source_width * source_height > 25_000_000:
+                        return self._json(dict(error="The selected image dimensions are not supported."), 400)
+                except Exception as exc:
+                    return self._json(dict(error=f"Could not read the selected history image: {exc}"), 400)
+                cyber_key = next((name for name in SDC_MODELS if name.startswith("03 | CyberRealistic v9 |")), None)
+                if not cyber_key:
+                    return self._json(dict(error="CyberRealistic v9 is not available in the current model catalog."), 500)
+                # Fit the source to the model's 1024px generation limit without changing its aspect ratio materially.
+                fit = min(1.0, 1024.0 / max(source_width, source_height))
+                edit_width = max(512, min(1024, int(round((source_width * fit) / 64.0) * 64)))
+                edit_height = max(512, min(1024, int(round((source_height * fit) / 64.0) * 64)))
+                original_description = (source_meta.get("effective_prompt") or source_meta.get("prompt") or "").strip()
+                original_description = original_description[:1200]
+                edit_prompt = (
+                    "Preserve the source image as the visual truth. Keep its existing visual style, rendering method, "
+                    "colour palette, lighting, texture, camera viewpoint, perspective, composition, atmosphere, "
+                    "subject identity and all unmentioned objects and details unchanged. "
+                    + ("Original image description: " + original_description + ". " if original_description else "")
+                    + "Apply only this requested change: " + instruction + ". "
+                    "Do not restyle, redesign, reframe, or alter anything that was not requested."
+                )
+                edit_payload = {
+                    "prompt": edit_prompt,
+                    "negative": "",
+                    "model": G_SDC + cyber_key,
+                    "style": "none",
+                    "family": "auto",
+                    "quant": "Q4_K",
+                    "force_sdxl": False,
+                    "sampler": "Euler a",
+                    "steps": 8,
+                    "cfg": 1.0,
+                    "width": edit_width,
+                    "height": edit_height,
+                    "count": 1,
+                    "seed": -1,
+                    "precision": "auto",
+                    "token": hf_token or "",
+                    "reference_image_path": str(source_path),
+                    "reference_strength": strength,
+                    "source_image_name": filename,
+                    "edit_instruction": instruction,
+                }
+                with job_lock:
+                    job.update(running=True, progress=0.0, message="Starting CyberRealistic history edit…",
+                               images=[], error=None, stop=False)
+                try:
+                    threading.Thread(target=job_thread, args=(edit_payload,), daemon=True).start()
+                except Exception as exc:
+                    with job_lock:
+                        job["running"] = False
+                    return self._json(dict(error=f"Could not start the edit: {exc}"), 500)
+                return self._json(dict(ok=True, model=cyber_key, strength=strength))
             if route == "/api/story/parse":
                 try:
                     story = str(body.get("story") or "").strip()
@@ -2484,6 +2786,28 @@ def run_app(args):
                 entities = body.get("entities") or []
                 if not isinstance(entities, list):
                     entities = []
+                reference_image_path = None
+                reference_data = body.get("reference_image") or ""
+                if reference_data:
+                    if not isinstance(reference_data, str) or not reference_data.startswith("data:image/jpeg;base64,"):
+                        return self._json(dict(error="Invalid reference image. Upload a PNG, JPG or WebP image."), 400)
+                    try:
+                        encoded = reference_data.split(",", 1)[1]
+                        if len(encoded) > 12_000_000:
+                            return self._json(dict(error="Compressed reference image is too large."), 413)
+                        raw_image = base64.b64decode(encoded, validate=True)
+                        with Image.open(io.BytesIO(raw_image)) as check:
+                            if check.format not in ("JPEG", "PNG", "WEBP"):
+                                raise ValueError("unsupported image format")
+                            if check.width * check.height > 20_000_000:
+                                raise ValueError("image dimensions are too large")
+                            check.verify()
+                        with Image.open(io.BytesIO(raw_image)) as source_image:
+                            clean_image = source_image.convert("RGB")
+                            reference_image_path = STORY_REF_DIR / (time.strftime("%Y%m%d_%H%M%S_") + os.urandom(5).hex() + ".jpg")
+                            clean_image.save(reference_image_path, "JPEG", quality=94, optimize=True)
+                    except (ValueError, binascii.Error, OSError) as exc:
+                        return self._json(dict(error=f"Could not process reference image: {exc}"), 400)
                 common = (
                     "Maintain strict visual continuity across all scenes. "
                     "Use the same character appearance, clothing, proportions, and recurring object designs. "
@@ -2520,6 +2844,8 @@ def run_app(args):
                     "family": body.get("family", "auto"),
                     "force_sdxl": bool(body.get("force_sdxl", False)),
                     "sampler": body.get("sampler", "Euler a"),
+                    "reference_image_path": str(reference_image_path) if reference_image_path else None,
+                    "reference_strength": max(0.20, min(1.0, float(body.get("reference_strength", 0.55)))),
                 }
                 def story_batch():
                     try:
